@@ -1,20 +1,16 @@
 /**
- * Sim Dream "Grand Prix 2026 VF26" (v2.2) — vehicle parameter set.
+ * Vehicle constants for the 2026 "Grand Prix VF26".
  *
- * Extracted from the Assetto Corsa EVO mod package
- *   `Saved Games/ACE/mods/gp_2026_vf26.kspkg` → `content/cars/gp_2026_vf26/...`
- * (KsPkg file table de-obfuscated with the public Kunos XOR key, each asset decoded
- * from its protobuf wire format). Field meanings follow the Assetto Corsa
- * `car.ini` / `suspensions.ini` / `tyres.ini` / `aero.ini` / `engine.ini` schema the
- * EVO format is derived from.
+ * Source: Sim Dream Development — "Grand Prix 2026 VF26" (v2.2), Assetto Corsa EVO mod
+ * (`Saved Games/ACE/mods/gp_2026_vf26.kspkg`).
  *
- * Everything below marked `[mod]` is a value taken verbatim from the package.
- * Values marked `[setup]` come from the mod's default race setup
- * (`data/setup/vf26_setup.carsetup`), which overrides the base values in AC.
- * Values marked `[derived]` are computed from mod values (e.g. CG height from BASEY).
- * Values marked `[assumed]` are NOT present in the package (they live in Kunos'
- * shared `common_phsx` content or in binary blobs we could not decode) and were
- * chosen from public 2026 F1 data / typical AC F1 values. They are kept to a minimum.
+ * Parameters transcribed and adapted into TypeScript:
+ *  - [mod]: Direct extraction from mod data files
+ *  - [setup]: Default garage setup parameters
+ *  - [derived]: Computed/inferred geometric and physical properties
+ *  - [assumed]: FIA 2026 technical regulations baseline
+ *
+ * Provenance, copyright & licenses: see CREDITS.md in repository root.
  */
 
 import type { TireCompound } from '@/types/f1';

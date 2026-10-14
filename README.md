@@ -103,12 +103,14 @@ This repository includes an automated GitHub Actions workflow (`.github/workflow
 
 ---
 
-## Credits & Licenses
+## License & Credits
 
-- **Car Physics Data, 3D Model & Sounds**: **Sim Dream — "Grand Prix 2026 VF26" (v2.2)**, Assetto Corsa EVO mod. The vehicle parameters in `src/lib/sim/vf26-data.ts` are taken from the mod package; values marked `[assumed]` there are not from the mod. The model, liveries, driver skins and sounds are converted locally by `scripts/vf26/` and are not part of this repository or its deployments.
+- **Project License**: Licensed under the [MIT License](LICENSE).
+- **Full Provenance & Credits**: See [CREDITS.md](CREDITS.md) for full breakdown of all third-party mod sources, authors, and mathematical references.
+- **Car Physics Data, 3D Model & Sounds**: **Sim Dream Development — "Grand Prix 2026 VF26" (v2.2)**, Assetto Corsa EVO mod. The vehicle parameters in `src/lib/sim/vf26-data.ts` are taken from the mod package. Converted 3D models and sound banks are kept local/gitignored and are not redistributed.
 - **Driver Model & Sound Runtime**: **Kunos Simulazioni — Assetto Corsa EVO** (base-game driver meshes and materials; the FMOD runtime is used only for local offline rendering).
-- **Gamepad Steering Assist Approach**: **Advanced Gamepad Assist** by **adam10603** (Custom Shaders Patch gamepad script for Assetto Corsa) — re-implemented in `src/lib/sim/gamepad-assist.ts`.
-- **Audio Synthesis & Visual FX Reference**: [**Speed Dreams / TORCS**](https://sourceforge.net/projects/speed-dreams/) — GPL-2.0+ License.
-- **Track Occupancy, Reference Lap & MPC Observation Architecture**: [**`assetto_corsa_gym`**](https://github.com/autonomous-racing-lab/assetto_corsa_gym) — MIT License.
-- **Track Layout & 3D Circuit Assets**: **Rwanda International Circuit (F1 2026 Variant)** by **Romeo Gagliotti (AlphaRomeo127)** (`ui_track.json`).
+- **Gamepad Steering Assist**: Concept inspired by **Advanced Gamepad Assist** by **adam10603** (Custom Shaders Patch for Assetto Corsa) — authored in `src/lib/sim/gamepad-assist.ts`.
+- **Audio Synthesis Math**: [**Speed Dreams / TORCS**](https://sourceforge.net/projects/speed-dreams/) — GPL-2.0+ (acoustic equations in `CarAudio.ts`).
+- **Track Layout & Geometry**: **Rwanda International Circuit (v1.1, F1 2026 Layout)** by **Romeo Gagliotti (AlphaRomeo127)**. Reverse-engineered and converted into a web-optimized binary format via `scripts/build-rwanda-track.mjs`. Raw mod archives are not hosted.
+
 
