@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  --f1-red: #e10600;
+  --f1-carbon: #15151e;
+  --f1-carbon-deep: #0b0b10;
+  --f1-purple: #b138ff;
+  --f1-green: #00d26a;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #0b0b10;
+  color: #ffffff;
+  font-family: var(--font-titillium), ui-sans-serif, system-ui, sans-serif;
+  overflow: hidden;
+}
+
+.font-f1-display {
+  font-family: var(--font-orbitron), var(--font-titillium), sans-serif;
+  letter-spacing: 0.05em;
+}
+
+.font-f1-italic {
+  font-family: var(--font-titillium), sans-serif;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+
+.font-f1-mono {
+  font-family: var(--font-jetbrains), ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.f1-panel {
+  background: linear-gradient(180deg, rgba(21, 21, 30, 0.94) 0%, rgba(11, 11, 16, 0.96) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.75);
+}
+
+.f1-corner-tr {
+  border-top: 3px solid #e10600;
+  border-right: 3px solid #e10600;
+  border-top-right-radius: 14px;
+}
+
+.f1-clip-card {
+  clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 0 100%);
+}
+
