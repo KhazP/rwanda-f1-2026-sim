@@ -14,7 +14,7 @@ import * as THREE from 'three';
 import { createF1Car2026, F1CarRig2026 } from '@/lib/car-builder-2026';
 import { LIVERIES } from '@/lib/track-data';
 import { CarTelemetry, LiveryConfig } from '@/types/f1';
-import { SimWheelState } from './wheel';
+import type { VehicleWheelState as SimWheelState } from './vehicle-types';
 import { InterpolatedPeerState } from './multiplayer-sync';
 
 const MAX_SKID_SEGMENTS = 900; // Ring buffer of 4-vertex quad segments across all 4 wheels

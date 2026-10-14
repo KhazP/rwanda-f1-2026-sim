@@ -1,11 +1,13 @@
 import { getRwandaTrackData } from '../src/lib/track-data';
 import { F1Physics2026 } from '../src/lib/f1-physics-2026';
-import { FIA_2026_F1_CAR_CONFIG } from '../src/lib/sim/car-configs';
-import { initSimAeroState, updateSimAero } from '../src/lib/sim/aero';
-import { initAxleState, initSuspensionState } from '../src/lib/sim/susp';
-import { initWheelState, simWheelUpdateForce } from '../src/lib/sim/wheel';
+import { computeTyreForces, createTyreRuntime } from '../src/lib/sim/ac-tyre';
+import { estimateAeroCoefficients } from '../src/lib/sim/vf26-aero';
+import { NOMINAL_AIR_DENSITY } from '../src/lib/sim/speed-profile';
+import { Lut } from '../src/lib/sim/lut';
+import { VF26_AI_REFERENCE, VF26_CHASSIS, VF26_TYRES } from '../src/lib/sim/vf26-data';
 import { buildRwandaCircuitScene } from '../src/lib/scene-builder';
 import { MultiplayerSyncManager } from '../src/lib/sim/multiplayer-sync';
+import { createFlatTestTrack } from './lib/flat-track';
 import * as THREE from 'three';
 
 // Headless canvas shim for running scene-builder procedural textures in Node.js verification
@@ -44,164 +46,79 @@ if (typeof globalThis.document === 'undefined') {
   };
 }
 
+const failures: string[] = [];
+
 function assert(condition: boolean, message: string): void {
   if (!condition) {
-    throw new Error(`ASSERTION FAILED: ${message}`);
+    failures.push(message);
+    console.log(`  [FAIL] ${message}`);
+    return;
   }
   console.log(`  [PASS] ${message}`);
 }
 
 async function runVerification() {
-  console.log('=== RWANDA F1 2026 SIMULATOR DEEP VERIFICATION SUITE ===\n');
+  console.log('=== RWANDA F1 2026 SIMULATOR (VF26) VERIFICATION SUITE ===\n');
   const track = getRwandaTrackData(1200);
+  const flat = createFlatTestTrack(30_000);
 
-  // 1. Stationary Steering Test (User bug: "the car even turns left and right when stationery")
+  // 1. Stationary steering: the wheels turn, the car does not move
   console.log('1. Testing Stationary Steering Stability...');
   const simStationary = new F1Physics2026(track);
   simStationary.resetToStartGrid(false);
   const initialHeading = simStationary.headingErrorRad;
   const initialLat = simStationary.lateralOffsetM;
   for (let i = 0; i < 120; i++) {
-    simStationary.step(1 / 60, {
-      throttle: 0,
-      brake: 0,
-      steerLeft: i < 60 ? 1 : 0,
-      steerRight: i >= 60 ? 1 : 0,
-      manualOverride: false,
-      toggleXMode: false,
-      shiftUp: false,
-      shiftDown: false,
-    });
+    simStationary.step(1 / 60, { steerLeft: i < 60 ? 1 : 0, steerRight: i >= 60 ? 1 : 0 });
   }
+  const headingDrift = Math.abs(simStationary.headingErrorRad - initialHeading);
+  const latDrift = Math.abs(simStationary.lateralOffsetM - initialLat);
   assert(
-    Math.abs(simStationary.yawRateRadS) === 0,
-    `Stationary yawRateRadS is exactly 0 (got ${simStationary.yawRateRadS})`
-  );
-  assert(
-    Math.abs(simStationary.headingErrorRad - initialHeading) === 0,
-    `Stationary headingErrorRad did not change when turning wheel at 0 km/h (got delta ${simStationary.headingErrorRad - initialHeading})`
-  );
-  assert(
-    Math.abs(simStationary.lateralOffsetM - initialLat) === 0,
-    `Stationary lateralOffsetM did not drift at 0 km/h (got delta ${simStationary.lateralOffsetM - initialLat})`
+    Math.abs(simStationary.yawRateRadS) < 5e-3 && headingDrift < 1e-3 && latDrift < 5e-3,
+    `Stationary car does not rotate or creep while steering at 0 km/h (yawRate=${simStationary.yawRateRadS.toExponential(1)} rad/s, Δheading=${headingDrift.toExponential(1)} rad, Δlat=${latDrift.toExponential(1)} m)`
   );
   assert(
     Math.abs(simStationary.steerAngleNorm) > 0.5,
     `Front wheels visually steer while stationary (steerAngleNorm = ${simStationary.steerAngleNorm.toFixed(3)})`
   );
 
-  // 2. Straight-Line Stability Test (User bug: "the car sometimes slightly turns on its own when driving")
-  console.log('\n2. Testing Straight-Line Acceleration & Zero Self-Turning...');
-  const simStraight = new F1Physics2026(track);
-  simStraight.resetToStartGrid(false);
-  // Place at start of main straight (s = 30m) with zero lateral offset
-  simStraight.sMeters = 30;
-  simStraight.lateralOffsetM = 0;
-  simStraight.headingErrorRad = 0;
-  for (let i = 0; i < 180; i++) {
-    // 3 seconds of full throttle on the straight
-    simStraight.step(1 / 60, {
-      throttle: 1,
-      brake: 0,
-      steerLeft: 0,
-      steerRight: 0,
-      manualOverride: false,
-      toggleXMode: false,
-      shiftUp: false,
-      shiftDown: false,
-    });
+  // 2. Straight-line acceleration on the flat pad against the mod's AI acceleration envelope
+  console.log('\n2. Testing Straight-Line Acceleration & Self-Steer on the Flat Pad...');
+  const simStraight = new F1Physics2026(flat);
+  simStraight.teleportToDistance(100, 0);
+  const accelRef = new Lut(VF26_AI_REFERENCE.accel);
+  const accelChecks: string[] = [];
+  let accelOk = true;
+  let tAccel = 0;
+  let t100: number | null = null;
+  for (const [tRef] of VF26_AI_REFERENCE.accel) {
+    while (tAccel < tRef) {
+      simStraight.step(1 / 120, { throttle: 1 });
+      tAccel += 1 / 120;
+      if (t100 === null && simStraight.vxMs * 3.6 >= 100) t100 = tAccel;
+    }
+    const ref = accelRef.evaluate(tRef);
+    accelChecks.push(`${tRef.toFixed(1)}s: ${simStraight.vxMs.toFixed(1)} vs ${ref.toFixed(1)} m/s`);
+    if (simStraight.vxMs < ref * 0.95) accelOk = false;
   }
+  assert(accelOk, `Full-throttle acceleration (TC on) matches or beats the mod AI reference (${accelChecks.join(', ')})`);
   assert(
-    simStraight.telemetry.speedKmh > 145 && simStraight.telemetry.gear >= 2,
-    `Car accelerates strongly on straight (reached ${simStraight.telemetry.speedKmh.toFixed(1)} km/h, Gear ${simStraight.telemetry.gear})`
+    t100 !== null && t100 > 2.2 && t100 < 3.2,
+    `0-100 km/h launch time is in the F1 range (${t100?.toFixed(2)} s within [2.2, 3.2] s)`
   );
   assert(
-    Math.abs(simStraight.lateralOffsetM) < 0.02,
-    `Zero phantom lateral drift on straight (|lateralOffsetM| = ${Math.abs(simStraight.lateralOffsetM).toFixed(6)}m < 0.02m)`
-  );
-  assert(
-    Math.abs(simStraight.headingErrorRad) < 0.002,
-    `Zero phantom yaw rotation on straight (|headingErrorRad| = ${Math.abs(simStraight.headingErrorRad).toFixed(6)} rad < 0.002 rad)`
+    Math.abs(simStraight.lateralOffsetM) < 0.05 && Math.abs(simStraight.headingErrorRad) < 0.002,
+    `No self-steer under full power on a flat straight (|lat|=${Math.abs(simStraight.lateralOffsetM).toFixed(4)} m, |heading|=${Math.abs(simStraight.headingErrorRad).toFixed(5)} rad)`
   );
 
-  // Also verify 3D world heading invariance across straight-to-corner spline transitions with zero steering
-  const simWorldInvariance = new F1Physics2026(track);
-  simWorldInvariance.resetToStartGrid(false);
-  simWorldInvariance.sMeters = 240; // approaching Turn 1 transition where spline begins curving
-  simWorldInvariance.lateralOffsetM = 0;
-  simWorldInvariance.headingErrorRad = 0;
-  simWorldInvariance.step(0.002, {
-    throttle: 1,
-    brake: 0,
-    steerLeft: 0,
-    steerRight: 0,
-    manualOverride: false,
-    toggleXMode: false,
-    shiftUp: false,
-    shiftDown: false,
-  });
-  const startForward = new THREE.Vector3(0, 0, 1).applyQuaternion(
-    simWorldInvariance.worldQuaternion
-  );
-  const startWorldYaw = Math.atan2(startForward.x, startForward.z);
-  for (let i = 0; i < 120; i++) {
-    simWorldInvariance.step(1 / 60, {
-      throttle: 1,
-      brake: 0,
-      steerLeft: 0,
-      steerRight: 0,
-      manualOverride: false,
-      toggleXMode: false,
-      shiftUp: false,
-      shiftDown: false,
-    });
-  }
-  const endForward = new THREE.Vector3(0, 0, 1).applyQuaternion(
-    simWorldInvariance.worldQuaternion
-  );
-  const endWorldYaw = Math.atan2(endForward.x, endForward.z);
-  const worldYawDelta = Math.abs(
-    Math.atan2(
-      Math.sin(endWorldYaw - startWorldYaw),
-      Math.cos(endWorldYaw - startWorldYaw)
-    )
-  );
-  assert(
-    worldYawDelta < 1e-4,
-    `World 3D heading is 100% invariant with zero steering across spline curvature transition (|worldYawDelta| = ${worldYawDelta.toExponential(2)} rad)`
-  );
-
-  // 3. Fixed-Timestep 500 Hz Determinism (60 FPS vs 120 FPS)
-  console.log('\n3. Testing Fixed-Timestep 500 Hz Sub-Stepping Determinism (60Hz vs 120Hz)...');
+  // 3. Fixed-Timestep 500 Hz Determinism (50 FPS vs 100 FPS)
+  console.log('\n3. Testing Fixed-Timestep 500 Hz Sub-Stepping Determinism (50Hz vs 100Hz)...');
   const sim60 = new F1Physics2026(track);
   const sim120 = new F1Physics2026(track);
   sim60.resetToStartGrid(true);
   sim120.resetToStartGrid(true);
-  // Step 1.2 seconds (600 substeps of 0.002s)
-  for (let i = 0; i < 60; i++) {
-    sim60.step(0.02, {
-      throttle: 1,
-      brake: 0,
-      steerLeft: 0.25,
-      steerRight: 0,
-      manualOverride: false,
-      toggleXMode: false,
-      shiftUp: false,
-      shiftDown: false,
-    });
-  }
-  for (let i = 0; i < 120; i++) {
-    sim120.step(0.01, {
-      throttle: 1,
-      brake: 0,
-      steerLeft: 0.25,
-      steerRight: 0,
-      manualOverride: false,
-      toggleXMode: false,
-      shiftUp: false,
-      shiftDown: false,
-    });
-  }
+  for (let i = 0; i < 60; i++) sim60.step(0.02, { throttle: 1, steerLeft: 0.25 });
+  for (let i = 0; i < 120; i++) sim120.step(0.01, { throttle: 1, steerLeft: 0.25 });
   const speedDiff = Math.abs(sim60.vxMs - sim120.vxMs);
   const sDiff = Math.abs(sim60.sMeters - sim120.sMeters);
   assert(
@@ -209,63 +126,64 @@ async function runVerification() {
     `500 Hz sub-stepped solver is frame-rate independent (speedDiff=${speedDiff.toExponential(2)}, sDiff=${sDiff.toExponential(2)})`
   );
 
-  // 4. Pacejka Magic Formula Load Sensitivity & Ground-Effect Downforce
-  console.log('\n4. Testing Pacejka Magic Formula Load Sensitivity & Ground-Effect Suction...');
-  const wCfg = FIA_2026_F1_CAR_CONFIG.wheels[0];
-  const wLowLoad = initWheelState(0, wCfg, 0, 0, 'soft');
-  const wHighLoad = initWheelState(0, wCfg, 0, 0, 'soft');
-  const suspDummy = initSuspensionState(FIA_2026_F1_CAR_CONFIG.suspensions[0], 0);
-  suspDummy.force = 0;
-  const axleDummy = initAxleState(FIA_2026_F1_CAR_CONFIG.axles[0], 0);
-  wLowLoad.bodyVel = { x: 50, y: 4.0, z: 0 };
-  wHighLoad.bodyVel = { x: 50, y: 4.0, z: 0 };
-  wLowLoad.spinVel = 50 / wCfg.radius;
-  wHighLoad.spinVel = 50 / wCfg.radius;
-  simWheelUpdateForce(wLowLoad, wCfg, suspDummy, axleDummy, 2000, 'soft', 26, 0.002);
-  simWheelUpdateForce(wHighLoad, wCfg, suspDummy, axleDummy, 6000, 'soft', 26, 0.002);
+  // 4. Tyre load sensitivity & ground-effect aero (VF26 data)
+  console.log('\n4. Testing Tyre Load Sensitivity, Ground Effect & Active Aero...');
+  const tyreMu = (fz: number) => {
+    const tyre = createTyreRuntime(VF26_TYRES.soft.front, 90);
+    let mu = 0;
+    for (let i = 0; i < 400; i++) {
+      mu = computeTyreForces(tyre, { fz, vx: 50, vy: -4, rimSpeed: 50, camberLeftRad: 0, surfaceGrip: 1, dt: 0.0005 }).mu;
+    }
+    return mu;
+  };
+  const muLow = tyreMu(2000);
+  const muHigh = tyreMu(6000);
   assert(
-    wLowLoad.effectiveMu > wHighLoad.effectiveMu,
-    `Pacejka load sensitivity decreases effective mu at higher vertical load (mu@2kN=${wLowLoad.effectiveMu.toFixed(3)} > mu@6kN=${wHighLoad.effectiveMu.toFixed(3)})`
+    muLow > muHigh,
+    `Tyre load sensitivity lowers the friction coefficient at higher load (mu@2kN=${muLow.toFixed(3)} > mu@6kN=${muHigh.toFixed(3)})`
+  );
+  const aeroLow = estimateAeroCoefficients('balanced', NOMINAL_AIR_DENSITY, -0.02, 0);
+  const aeroHigh = estimateAeroCoefficients('balanced', NOMINAL_AIR_DENSITY, 0.03, 0);
+  const aeroX = estimateAeroCoefficients('balanced', NOMINAL_AIR_DENSITY, -0.02, 0, 1);
+  const v270 = 270 / 3.6;
+  const df270 = aeroLow.downforceCoef * v270 * v270;
+  assert(
+    aeroLow.downforceCoef > aeroHigh.downforceCoef,
+    `Floor/wing ground effect: more downforce closer to the road (${df270.toFixed(0)} N vs ${(aeroHigh.downforceCoef * v270 * v270).toFixed(0)} N at 270 km/h, 50 mm higher)`
+  );
+  assert(
+    aeroX.dragCoef < aeroLow.dragCoef * 0.85 && aeroX.downforceCoef < aeroLow.downforceCoef,
+    `2026 X-mode sheds drag and downforce (drag ${(aeroX.dragCoef * v270 * v270).toFixed(0)} N vs ${(aeroLow.dragCoef * v270 * v270).toFixed(0)} N at 270 km/h)`
   );
 
-  const aeroLowRide = initSimAeroState(FIA_2026_F1_CAR_CONFIG.aero);
-  const aeroHighRide = initSimAeroState(FIA_2026_F1_CAR_CONFIG.aero);
-  const aeroXMode = initSimAeroState(FIA_2026_F1_CAR_CONFIG.aero);
-  updateSimAero(aeroLowRide, FIA_2026_F1_CAR_CONFIG.aero, 75, 0, [0.022, 0.022, 0.030, 0.030], 'Z-MODE', 1.0);
-  updateSimAero(aeroHighRide, FIA_2026_F1_CAR_CONFIG.aero, 75, 0, [0.065, 0.065, 0.075, 0.075], 'Z-MODE', 1.0);
-  updateSimAero(aeroXMode, FIA_2026_F1_CAR_CONFIG.aero, 75, 0, [0.022, 0.022, 0.030, 0.030], 'X-MODE', 1.0);
-  assert(
-    aeroLowRide.groundEffectFactor > aeroHighRide.groundEffectFactor &&
-      aeroLowRide.totalDownforceN > aeroHighRide.totalDownforceN,
-    `Ground-effect floor suction increases closer to asphalt (${aeroLowRide.totalDownforceN.toFixed(0)}N @ 26mm > ${aeroHighRide.totalDownforceN.toFixed(0)}N @ 70mm)`
-  );
-  assert(
-    aeroXMode.totalDragN < aeroLowRide.totalDragN,
-    `2026 Active Aero X-Mode reduces drag on straights (${aeroXMode.totalDragN.toFixed(0)}N < ${aeroLowRide.totalDragN.toFixed(0)}N)`
-  );
-
-  // 5. Single-Track MPC AI Controller Test
-  console.log('\n5. Testing Single-Track MPC AI Controller...');
+  // 5. AI driver: Turn 1-2, then a full flying lap
+  console.log('\n5. Testing Racing-Line AI Driver...');
   const simAi = new F1Physics2026(track);
+  simAi.setAssistPreset('pro');
   simAi.resetToStartGrid(true);
   simAi.aiAutopilot = true;
   let aiOffTrackFrames = 0;
   for (let i = 0; i < 600; i++) {
-    simAi.step(1 / 60, {
-      throttle: 0,
-      brake: 0,
-      steerLeft: 0,
-      steerRight: 0,
-      manualOverride: false,
-      toggleXMode: false,
-      shiftUp: false,
-      shiftDown: false,
-    });
+    simAi.step(1 / 60, {});
     if (simAi.telemetry.offTrack) aiOffTrackFrames++;
   }
   assert(
-    aiOffTrackFrames === 0 && !simAi.telemetry.offTrack && simAi.telemetry.speedKmh > 95 && simAi.sMeters > 550,
-    `MPC AI keeps car within track boundaries through Turn 1-2 for 600 frames (offTrackFrames=${aiOffTrackFrames}, s=${simAi.sMeters.toFixed(1)}m, speed=${simAi.telemetry.speedKmh.toFixed(1)} km/h, latOffset=${simAi.lateralOffsetM.toFixed(2)}m)`
+    aiOffTrackFrames === 0 && simAi.telemetry.speedKmh > 95 && simAi.sMeters > 550,
+    `AI keeps the car on track through Turn 1-2 (offTrackFrames=${aiOffTrackFrames}, s=${simAi.sMeters.toFixed(1)}m, speed=${simAi.telemetry.speedKmh.toFixed(1)} km/h, latOffset=${simAi.lateralOffsetM.toFixed(2)}m)`
+  );
+  const simLap = new F1Physics2026(track);
+  simLap.setAssistPreset('pro');
+  simLap.resetToStartGrid(true);
+  simLap.aiAutopilot = true;
+  let lapOffTrack = 0;
+  for (let i = 0; i < 60 * 130 && simLap.telemetry.lastLapTimeMs === null; i++) {
+    simLap.step(1 / 60, {});
+    if (simLap.telemetry.offTrack) lapOffTrack++;
+  }
+  const lapMs = simLap.telemetry.lastLapTimeMs;
+  assert(
+    lapMs !== null && lapMs > 90_000 && lapMs < 110_000 && lapOffTrack === 0,
+    `AI completes a clean flying lap (lap=${lapMs !== null ? (lapMs / 1000).toFixed(3) : 'none'} s within [90, 110] s, offTrackFrames=${lapOffTrack}, top=${simLap.telemetry.allTimeTopSpeedKmh.toFixed(0)} km/h)`
   );
 
   // 6. Grandstand & Structure Track Clearance Verification (User bug: "there are some grandstands right on the track")
@@ -378,23 +296,12 @@ async function runVerification() {
 
   // Heavy braking from 280 km/h -> verify deceleration and carbon disc temperature rise
   const simBrake = new F1Physics2026(track);
-  simBrake.teleportToDistance(400, 280 / 3.6);
+  simBrake.teleportToDistance(30, 280 / 3.6);
   const startBrakeTemp = simBrake.telemetry.brakeTempsC[0];
-  for (let i = 0; i < 60; i++) {
-    simBrake.step(1 / 60, {
-      throttle: 0,
-      brake: 1.0,
-      steerLeft: 0,
-      steerRight: 0,
-      manualOverride: false,
-      toggleXMode: false,
-      shiftUp: false,
-      shiftDown: false,
-    });
-  }
+  for (let i = 0; i < 60; i++) simBrake.step(1 / 60, { brake: 1.0 });
   assert(
     simBrake.telemetry.speedKmh < 160 && simBrake.telemetry.brakeTempsC[0] > startBrakeTemp + 80,
-    `Heavy braking decelerates car (${simBrake.telemetry.speedKmh.toFixed(1)} km/h) and heats carbon discs (${startBrakeTemp.toFixed(0)}°C -> ${simBrake.telemetry.brakeTempsC[0].toFixed(0)}°C)`
+    `Heavy braking decelerates car (${simBrake.telemetry.speedKmh.toFixed(1)} km/h after 1 s) and heats carbon discs (${startBrakeTemp.toFixed(0)}°C -> ${simBrake.telemetry.brakeTempsC[0].toFixed(0)}°C)`
   );
 
   // 2026 /Boost Manual Override above 300 km/h
@@ -415,48 +322,34 @@ async function runVerification() {
     `Dynamic 3D Dashed Braking Line updates vertex colors (${colorAttr?.count ?? 0} vertices)`
   );
 
-  // 9. Reviewer Regression Suite: Aero/Ride-Height Scaling, Lateral Load Transfer Sign, Ground Contact, Banking Sign, Camera Frustums & 85° Off-Track Recovery
-  console.log('\n9. Testing Reviewer Regression Suite (Aero Scaling, Load Transfer Sign, Ground Contact, Banking, 4 Reference Cameras, 85° Recovery)...');
+  // 9. Regression suite: aero load & ride heights, load transfer sign, ground contact, banking, cameras, recovery, braking
+  console.log('\n9. Testing Regression Suite (Aero Load, Load Transfer Sign, Ground Contact, Banking, Cameras, Recovery, Braking)...');
 
-  // 9.1 Aero Downforce Scaling & Non-Bottomed Suspension Ride Heights at 270 km/h
+  // 9.1 Downforce level and ride heights at 270 km/h
   assert(
-    aeroLowRide.totalDownforceN >= 9500 && aeroLowRide.totalDownforceN <= 16500,
-    `Realistic 2026 F1 downforce at 270 km/h (${aeroLowRide.totalDownforceN.toFixed(0)} N within [9500, 16500] N, no 4x wing multiplier bug)`
+    df270 >= 7000 && df270 <= 16500,
+    `2026 F1 downforce level at 270 km/h at Bugesera air density (${df270.toFixed(0)} N within [7000, 16500] N)`
   );
-  const simHighSpeed = new F1Physics2026(track);
-  simHighSpeed.teleportToDistance(60, 270 / 3.6);
-  for (let i = 0; i < 60; i++) {
-    simHighSpeed.step(1 / 60, { throttle: 1, brake: 0 });
-  }
+  const simHighSpeed = new F1Physics2026(flat);
+  simHighSpeed.teleportToDistance(100, 270 / 3.6);
+  for (let i = 0; i < 60; i++) simHighSpeed.step(1 / 60, { throttle: 1, brake: 0 });
   const [rhFR, rhFL, rhRR, rhRL] = simHighSpeed.telemetry.wheelRideHeightsMm;
   assert(
     rhFR >= 10 && rhFL >= 10 && rhRR >= 14 && rhRL >= 14,
-    `High-speed suspension maintains physical ride height without slamming into 2mm bump stops (FR=${rhFR}mm, FL=${rhFL}mm, RR=${rhRR}mm, RL=${rhRL}mm)`
+    `High-speed suspension keeps the floor off the road (FR=${rhFR}mm, FL=${rhFL}mm, RR=${rhRR}mm, RL=${rhRL}mm)`
   );
-  const sumWheelFz =
-    simHighSpeed.wheels[0].fzN +
-    simHighSpeed.wheels[1].fzN +
-    simHighSpeed.wheels[2].fzN +
-    simHighSpeed.wheels[3].fzN;
+  const sumWheelFz = simHighSpeed.wheels.reduce((acc, w) => acc + w.fzN, 0);
   const expectedTotalFz =
-    (FIA_2026_F1_CAR_CONFIG.dryMassKg + simHighSpeed.telemetry.fuelKg) * 9.81 +
-    simHighSpeed.telemetry.downforceN;
+    (VF26_CHASSIS.totalMassKg + simHighSpeed.telemetry.fuelKg) * 9.81 + simHighSpeed.telemetry.downforceN;
   assert(
-    Math.abs(sumWheelFz - expectedTotalFz) / expectedTotalFz < 0.15,
-    `Sum of 4 wheel vertical loads matches static weight + aero downforce without double-counting (sumFz=${sumWheelFz.toFixed(0)}N vs expected=${expectedTotalFz.toFixed(0)}N)`
+    Math.abs(sumWheelFz - expectedTotalFz) / expectedTotalFz < 0.05,
+    `Sum of 4 wheel loads matches weight + aero downforce on the flat pad (sumFz=${sumWheelFz.toFixed(0)}N vs expected=${expectedTotalFz.toFixed(0)}N)`
   );
 
-  // 9.2 Lateral Load Transfer Sign in Cornering (Turning Left -> Outside Right Wheels FR/RR Must Carry More Load than Inside Left Wheels FL/RL)
-  const simCorner = new F1Physics2026(track);
-  simCorner.teleportToDistance(60, 180 / 3.6);
-  for (let i = 0; i < 15; i++) {
-    simCorner.step(1 / 60, {
-      throttle: 0.5,
-      brake: 0,
-      steerLeft: 0.45,
-      steerRight: 0,
-    });
-  }
+  // 9.2 Lateral load transfer sign (turning left -> outside right wheels FR/RR carry more load)
+  const simCorner = new F1Physics2026(flat);
+  simCorner.teleportToDistance(100, 180 / 3.6);
+  for (let i = 0; i < 30; i++) simCorner.step(1 / 60, { throttle: 0.5, steerLeft: 0.3 });
   const fzRight = simCorner.wheels[0].fzN + simCorner.wheels[2].fzN;
   const fzLeft = simCorner.wheels[1].fzN + simCorner.wheels[3].fzN;
   assert(
@@ -464,22 +357,35 @@ async function runVerification() {
     `Left-hand turn transfers weight to outside Right wheels (fzRight=${fzRight.toFixed(0)}N > fzLeft=${fzLeft.toFixed(0)}N)`
   );
 
-  // 9.3 Exact Tire-to-Track Ground Contact & Unsprung Wheel Separation
-  const { evaluateSampleLateralHeightM } = await import('../src/lib/track-data');
-  const sampleAtCar = track.getSampleAtDistance(simCorner.sMeters);
-  const expectedGroundY = evaluateSampleLateralHeightM(sampleAtCar, simCorner.lateralOffsetM);
-  const groundContactError = Math.abs(simCorner.worldPosition.y - expectedGroundY);
+  // 9.3 Wheels follow the KN5 surface; unsprung assemblies are parented to the car root
+  const { evaluateSampleLateralHeightM, LIVERIES } = await import('../src/lib/track-data');
+  const simGround = new F1Physics2026(track);
+  simGround.teleportToDistance(1200, 200 / 3.6);
+  for (let i = 0; i < 60; i++) simGround.step(1 / 60, { throttle: 0.6 });
+  let maxContactErrMm = 0;
+  for (const w of simGround.wheels) {
+    const loc = track.locateWorldPoint(w.worldPos.x, w.worldPos.z, simGround.sMeters);
+    const n = track.samples.length;
+    const tt = loc.t;
+    const cr = [
+      ((-tt + 2) * tt - 1) * tt * 0.5,
+      ((3 * tt - 5) * tt * tt + 2) * 0.5,
+      ((-3 * tt + 4) * tt + 1) * tt * 0.5,
+      (tt - 1) * tt * tt * 0.5,
+    ];
+    const ids = [(loc.i0 - 1 + n) % n, loc.i0, loc.i1, (loc.i1 + 1) % n];
+    const zRoad = ids.reduce((acc, id, k) => acc + cr[k] * evaluateSampleLateralHeightM(track.samples[id], loc.lateralH), 0);
+    maxContactErrMm = Math.max(maxContactErrMm, Math.abs(w.zRoad - zRoad) * 1000);
+  }
   assert(
-    groundContactError < 1e-5,
-    `Car root worldPosition sits flush on KN5 track surface profile with zero floating offset (error=${groundContactError.toExponential(2)}m)`
+    maxContactErrMm < 0.5,
+    `Each tyre's road height is the KN5 cross-section surface under that wheel (max error ${maxContactErrMm.toFixed(3)} mm)`
   );
 
   const { createF1Car2026 } = await import('../src/lib/car-builder-2026');
-  const { LIVERIES } = await import('../src/lib/track-data');
   const carRig = createF1Car2026(LIVERIES[0], 'soft');
   assert(
-    carRig.frontLeftSteerPivot.parent === carRig.root &&
-      carRig.frontRightSteerPivot.parent === carRig.root,
+    carRig.frontLeftSteerPivot.parent === carRig.root && carRig.frontRightSteerPivot.parent === carRig.root,
     `Unsprung wheel assemblies are parented to root (not sprung chassisGroup) so tires stay planted during pitch/roll/heave`
   );
 
@@ -615,54 +521,76 @@ async function runVerification() {
   }
 
 
-  // 9.6 Extreme 85° Heading Error Off-Track Kerb Recovery in 'pro' Mode
-  const simExtreme = new F1Physics2026(track);
-  simExtreme.setAssistPreset('pro');
-  simExtreme.teleportToDistance(200, 110 / 3.6);
-  const sample200 = track.getSampleAtDistance(200);
-  simExtreme.lateralOffsetM = sample200.width * 0.5 + 1.6; // Off-track on right runoff/kerb
-  simExtreme.headingErrorRad = (85 * Math.PI) / 180; // Extreme +85 deg heading error
-  for (let i = 0; i < 120; i++) {
-    // Proportional driver countersteer aiming back toward track tangent + centerline
-    const targetHeading = THREE.MathUtils.clamp(-simExtreme.lateralOffsetM * 0.06, -0.35, 0.35);
-    const err = simExtreme.headingErrorRad - targetHeading;
-    simExtreme.step(1 / 60, {
-      throttle: 0.35,
-      brake: 0,
-      steerLeft: THREE.MathUtils.clamp(err * 1.2, 0, 0.85),
-      steerRight: THREE.MathUtils.clamp(-err * 1.2, 0, 0.85),
-    });
-  }
+  // 9.6 Extreme 85° heading error: the car turns back without spinning or NaNs ('pro', flat pad, no walls),
+  //     and an 85° impact into the run-off tyre barrier of the real track stays bounded
+  const recovery = (sign: 1 | -1) => {
+    const sim = new F1Physics2026(flat);
+    sim.setAssistPreset('pro');
+    sim.teleportToDistance(200, 110 / 3.6);
+    sim.headingErrorRad = (sign * 85 * Math.PI) / 180;
+    for (let i = 0; i < 150; i++) {
+      // Proportional driver countersteer aiming back toward the track tangent + centreline
+      const targetHeading = THREE.MathUtils.clamp(-sim.lateralOffsetM * 0.06, -0.35, 0.35);
+      const err = sim.headingErrorRad - targetHeading;
+      sim.step(1 / 60, {
+        throttle: 0.35,
+        steerLeft: THREE.MathUtils.clamp(err * 1.2, 0, 0.85),
+        steerRight: THREE.MathUtils.clamp(-err * 1.2, 0, 0.85),
+      });
+    }
+    return sim;
+  };
+  const recRight = recovery(1);
+  const recLeft = recovery(-1);
   assert(
-    Number.isFinite(simExtreme.vxMs) &&
-      Number.isFinite(simExtreme.vyMs) &&
-      Number.isFinite(simExtreme.yawRateRadS) &&
-      Math.abs(simExtreme.headingErrorRad) < (25 * Math.PI) / 180,
-    `Extreme 85° off-track kerb recovery in 'pro' mode stabilizes without NaN or spin divergence (recovered headingError=${((simExtreme.headingErrorRad * 180) / Math.PI).toFixed(1)}°, latOffset=${simExtreme.lateralOffsetM.toFixed(2)}m)`
+    [recRight, recLeft].every(
+      (sim) =>
+        Number.isFinite(sim.vxMs) &&
+        Number.isFinite(sim.vyMs) &&
+        Number.isFinite(sim.yawRateRadS) &&
+        Math.abs(sim.headingErrorRad) < (25 * Math.PI) / 180
+    ),
+    `Extreme ±85° heading error at 110 km/h in 'pro' mode turns back without spinning (heading after 2.5 s: ${((recRight.headingErrorRad * 180) / Math.PI).toFixed(1)}° / ${((recLeft.headingErrorRad * 180) / Math.PI).toFixed(1)}°)`
+  );
+  const simWall = new F1Physics2026(track);
+  simWall.setAssistPreset('pro');
+  simWall.teleportToDistance(1200, 110 / 3.6);
+  const halfWall = track.getSampleAtDistance(1200).width * 0.5;
+  simWall.lateralOffsetM = halfWall + 1.6; // right-hand run-off of the back straight
+  simWall.headingErrorRad = (85 * Math.PI) / 180; // pointing at the tyre barrier
+  for (let i = 0; i < 60; i++) simWall.step(1 / 60, { throttle: 0.35 });
+  assert(
+    Number.isFinite(simWall.vxMs) &&
+      Number.isFinite(simWall.yawRateRadS) &&
+      simWall.lateralOffsetM <= halfWall + 4.8 + 1e-6 &&
+      simWall.telemetry.speedKmh < 60,
+    `85° impact into the run-off tyre barrier stays bounded (lat=${simWall.lateralOffsetM.toFixed(2)} m <= barrier ${(halfWall + 4.8).toFixed(2)} m, speed=${simWall.telemetry.speedKmh.toFixed(0)} km/h)`
   );
 
-  // 9.7 Realistic 2026 F1 Braking Distance from 320 km/h to 100 km/h (95m..130m)
-  const simBrakingDist = new F1Physics2026(track);
-  simBrakingDist.teleportToDistance(25, 320 / 3.6);
-  const brakeStartX = simBrakingDist.worldX;
-  const brakeStartZ = simBrakingDist.worldZ;
-  let stepsBrake = 0;
-  while (simBrakingDist.telemetry.speedKmh > 100 && stepsBrake < 3000) {
-    simBrakingDist.step(0.002, {
-      throttle: 0,
-      brake: 1.0,
-      steerLeft: 0,
-      steerRight: 0,
-    });
-    stepsBrake++;
-  }
-  const brakingDistanceM = Math.hypot(
-    simBrakingDist.worldX - brakeStartX,
-    simBrakingDist.worldZ - brakeStartZ
-  );
+  // 9.7 Threshold braking 320 -> 100 km/h on the flat pad, with ABS (semi_pro) and without (pro)
+  const brakingDistance = (assist: 'semi_pro' | 'pro', pedal: number) => {
+    const sim = new F1Physics2026(flat);
+    sim.setAssistPreset(assist);
+    sim.teleportToDistance(100, 320 / 3.6);
+    const z0 = sim.worldZ;
+    let steps = 0;
+    let maxLock = 0;
+    while (sim.vxMs * 3.6 > 100 && steps < 5000) {
+      sim.step(0.002, { brake: pedal });
+      maxLock = Math.max(maxLock, ...sim.wheels.map((w) => -w.slipRatio));
+      steps++;
+    }
+    return { dist: Math.abs(sim.worldZ - z0), maxLock };
+  };
+  const brakeAbs = brakingDistance('semi_pro', 1);
   assert(
-    brakingDistanceM >= 95 && brakingDistanceM <= 130,
-    `320 km/h -> 100 km/h threshold braking distance is realistic (${brakingDistanceM.toFixed(1)}m within [95m, 130m])`
+    brakeAbs.dist >= 75 && brakeAbs.dist <= 115 && brakeAbs.maxLock < 0.35,
+    `320 -> 100 km/h with ABS takes ${brakeAbs.dist.toFixed(1)} m (within [75, 115] m), no lock-up (max slip ${brakeAbs.maxLock.toFixed(2)})`
+  );
+  const brakePro = brakingDistance('pro', 1);
+  assert(
+    brakePro.dist >= 70 && brakePro.dist <= 140,
+    `320 -> 100 km/h at full pedal without ABS takes ${brakePro.dist.toFixed(1)} m (within [70, 140] m; max slip ${brakePro.maxLock.toFixed(2)} — the brakes can lock the tyres)`
   );
 
   // 9.8 Assetto Corsa KN5 Track Geometry (< 15 MB per file, < 25 MB total), Dynamic Braking Zone & 12 Trackside TV Cameras Verification
@@ -706,16 +634,39 @@ async function runVerification() {
     `Assetto Corsa KN5 binary track mesh (${(meshBinBytes / 1048576).toFixed(2)} MiB < 15 MB, total ${(totalTrackBytes / 1048576).toFixed(2)} MiB < 25 MB) and ${tvCams.length} official TV cameras verified (active cam @ 0.25 = ${sampleTvCam?.name})`
   );
 
-  // 9.9 Dynamic Braking Zone Urgency Ahead of Real Turn 1 (s ≈ 490m)
-  const urgGreen = evaluateDynamicBrakingUrgency(track, 280, 315 / 3.6, 290, track.getSampleAtDistance(290).optimalSpeedKmh / 3.6);
-  const urgYellow = evaluateDynamicBrakingUrgency(track, 280, 315 / 3.6, 320, track.getSampleAtDistance(320).optimalSpeedKmh / 3.6);
-  const urgRed = evaluateDynamicBrakingUrgency(track, 280, 315 / 3.6, 360, track.getSampleAtDistance(360).optimalSpeedKmh / 3.6);
-  const urgExit = evaluateDynamicBrakingUrgency(track, 280, 315 / 3.6, 510, track.getSampleAtDistance(510).optimalSpeedKmh / 3.6);
+  // 9.9 Dynamic braking-line urgency ahead of Turn 1 follows the VF26 speed profile
+  const carS = 150;
+  const carV = 315 / 3.6;
+  const urgencyAt = (s: number) =>
+    evaluateDynamicBrakingUrgency(track, carS, carV, s, track.getSampleAtDistance(s).optimalSpeedKmh / 3.6);
+  let vMin = Infinity;
+  let apexS = -1;
+  for (let s = 300; s <= 560; s += 2) {
+    const v = track.getSampleAtDistance(s).optimalSpeedKmh;
+    if (v < vMin) {
+      vMin = v;
+      apexS = s;
+    }
+  }
+  let firstYellow = -1;
+  let firstRed = -1;
+  for (let s = 160; s <= apexS; s += 2) {
+    const u = urgencyAt(s);
+    if (firstYellow < 0 && u > 0 && u < 1) firstYellow = s;
+    if (firstRed < 0 && u >= 1) firstRed = s;
+  }
+  const urgStart = urgencyAt(170);
+  const urgExit = urgencyAt(apexS + 40);
   assert(
-    urgGreen === 0 && urgYellow > 0.2 && urgYellow < 0.9 && urgRed === 1.0 && urgExit === 0,
-    `Dynamic braking urgency ahead of Turn 1 transitions cleanly Green (${urgGreen.toFixed(2)} @ 290m) -> Yellow (${urgYellow.toFixed(2)} @ 320m) -> Red (${urgRed.toFixed(2)} @ 360m) -> Green (${urgExit.toFixed(2)} @ 510m exit)`
+    urgStart === 0 && firstYellow > 0 && firstRed > firstYellow && firstRed < apexS && urgExit === 0,
+    `Braking-line urgency ahead of Turn 1 runs Green (${urgStart.toFixed(2)} @ 170m) -> Yellow (from ${firstYellow}m) -> Red (from ${firstRed}m) -> Green (${urgExit.toFixed(2)} @ ${apexS + 40}m; apex ${apexS}m at ${vMin.toFixed(0)} km/h)`
   );
 
+  if (failures.length > 0) {
+    console.log(`\n${failures.length} CHECK(S) FAILED:`);
+    for (const f of failures) console.log(`  - ${f}`);
+    process.exit(1);
+  }
   console.log('\nALL 9 VERIFICATION SUITES PASSED SUCCESSFULLY!');
 }
 

@@ -24,7 +24,7 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "FORMULA 1 VISIT RWANDA GRAND PRIX 2029 — F1TV 2026 Simulator",
   description:
-    "Interactive 3D Formula 1 2026 simulator for the FIA Grade 1 Rwanda International Circuit (5.302 km, 18 turns, 50m elevation delta, 1,400m altitude, ±350 km/h top speed).",
+    "Interactive 3D Formula 1 2026 simulator for the FIA Grade 1 Rwanda International Circuit (5.302 km, 18 turns, 50m elevation delta, 1,400m altitude, ≈330 km/h top speed).",
 };
 
 export default function RootLayout({

@@ -7,6 +7,7 @@ import {
   TurnMetadata,
 } from "@/types/f1";
 import rawTrackJson from "../../public/tracks/rwanda/track_data.json";
+import { computeSpeedProfile, createVf26ProfileCarModel } from "./sim/speed-profile";
 
 export const BASE_ALTITUDE_M = 1385; // Bugesera baseline altitude (m ASL)
 export const RWANDA_BASE_ALTITUDE_M = BASE_ALTITUDE_M;
@@ -48,6 +49,15 @@ export interface BuiltTrackData {
     lateralOffset: number;
     distSq: number;
   };
+  /**
+   * Continuous world → track mapping: segment `i0 → i1` at parameter `t` (s = (i0 + t)·ds),
+   * with the signed horizontal lateral offset `lateralH` (+ right) used by the height profiles.
+   */
+  locateWorldPoint: (
+    worldX: number,
+    worldZ: number,
+    hintS?: number
+  ) => { i0: number; i1: number; t: number; s: number; lateralH: number };
 }
 
 export const RWANDA_TRACK_METADATA = rawTrackJson.metadata;
@@ -479,6 +489,22 @@ export function evaluateSampleLateralHeightM(
   return sample.position.y;
 }
 
+/**
+ * Uniform Catmull-Rom weights for samples [i−1, i, i+1, i+2] at parameter t ∈ [0, 1] between i and i+1.
+ * Used for road heights so the surface is C1 along the track: linear interpolation between
+ * profiles 4.4 m apart leaves slope kinks that hit the tyres like bumps at speed.
+ */
+export function catmullRomWeights(t: number): [number, number, number, number] {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return [
+    0.5 * (-t3 + 2 * t2 - t),
+    0.5 * (3 * t3 - 5 * t2 + 2),
+    0.5 * (-3 * t3 + 4 * t2 + t),
+    0.5 * (t3 - t2),
+  ];
+}
+
 export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
   if (cachedBuiltTrack && cachedBuiltTrack.samples.length === numSamples) {
     return cachedBuiltTrack;
@@ -522,9 +548,15 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     const span = Math.max(0.001, s1 - s0);
     const alpha = THREE.MathUtils.clamp((targetS - s0) / span, 0, 1);
 
-    const cx = THREE.MathUtils.lerp(r0.p[0], r1.p[0], alpha);
-    const cy = THREE.MathUtils.lerp(r0.p[1], r1.p[1], alpha);
-    const cz = THREE.MathUtils.lerp(r0.p[2], r1.p[2], alpha);
+    // Cubic (Catmull-Rom) resampling: linear interpolation of the ~4.9 m raw samples onto the
+    // 4.4 m grid leaves slope kinks that the tyres feel as a periodic road ripple
+    const rm1 = rawSamples[(rawIdx - 1 + rawCount) % rawCount] as typeof r0;
+    const r2 = rawSamples[(rawIdx + 2) % rawCount] as typeof r0;
+    const [cw0, cw1, cw2, cw3] = catmullRomWeights(alpha);
+    const cubic = (a: number, b: number, c: number, d: number) => cw0 * a + cw1 * b + cw2 * c + cw3 * d;
+    const cx = cubic(rm1.p[0], r0.p[0], r1.p[0], r2.p[0]);
+    const cy = cubic(rm1.p[1], r0.p[1], r1.p[1], r2.p[1]);
+    const cz = cubic(rm1.p[2], r0.p[2], r1.p[2], r2.p[2]);
     positions.push(new THREE.Vector3(cx, cy, cz));
 
     racingPositions.push(
@@ -539,15 +571,16 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     const meshBank = THREE.MathUtils.lerp(r0.b, r1.b, alpha);
     bankings.push(meshBank);
 
+    const nLat = LAT_PROFILE_OFFSETS.length;
     if (
-      r0.yProf &&
-      r1.yProf &&
-      r0.yProf.length === LAT_PROFILE_OFFSETS.length &&
-      r1.yProf.length === LAT_PROFILE_OFFSETS.length
+      rm1.yProf?.length === nLat &&
+      r0.yProf?.length === nLat &&
+      r1.yProf?.length === nLat &&
+      r2.yProf?.length === nLat
     ) {
-      const yp = new Array<number>(LAT_PROFILE_OFFSETS.length);
-      for (let k = 0; k < LAT_PROFILE_OFFSETS.length; k++) {
-        yp[k] = THREE.MathUtils.lerp(r0.yProf[k], r1.yProf[k], alpha);
+      const yp = new Array<number>(nLat);
+      for (let k = 0; k < nLat; k++) {
+        yp[k] = cubic(rm1.yProf[k], r0.yProf[k], r1.yProf[k], r2.yProf[k]);
       }
       yProfs.push(yp);
     } else {
@@ -560,6 +593,22 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     const v0 = (r0 as { v?: number }).v ?? 315;
     const v1 = (r1 as { v?: number }).v ?? 315;
     aiSpeedsKmh.push(THREE.MathUtils.lerp(v0, v1, alpha));
+  }
+
+  // Light [1, 2, 1] smoothing of the surface heights along the lap removes the remaining
+  // mesh-triangulation noise (±1–2 mm per sample) while keeping crests and compressions
+  {
+    const n = NUM_SAMPLES;
+    const ys = positions.map((p) => p.y);
+    const yp = yProfs.map((row) => row.slice());
+    for (let i = 0; i < n; i++) {
+      const a = (i - 1 + n) % n;
+      const b = (i + 1) % n;
+      positions[i].y = 0.25 * ys[a] + 0.5 * ys[i] + 0.25 * ys[b];
+      for (let k = 0; k < yp[i].length; k++) {
+        yProfs[i][k] = 0.25 * yp[a][k] + 0.5 * yp[i][k] + 0.25 * yp[b][k];
+      }
+    }
   }
 
   // Ensure the starting grid straight (s = 0..195m, already collinear within 1.2 cm in the KN5 road mesh)
@@ -680,54 +729,10 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     );
   }
 
-  // Compute physically grounded optimal speed profile (km/h) along the racing line
-  // using speed-dependent mechanical + aerodynamic lateral grip
-  const rawSpeedsMs: number[] = [];
-  for (let i = 0; i < NUM_SAMPLES; i++) {
-    const absK = Math.abs(curvatures[i]);
-    const bankBonus = Math.max(0, Math.tan(Math.abs(bankings[i]))) * 9.81;
-    if (absK < 0.0015) {
-      rawSpeedsMs.push(98.5);
-    } else {
-      const hairpinFactor = THREE.MathUtils.clamp((absK - 0.020) / 0.012, 0, 1);
-      const a0 = 17.8 - 2.4 * hairpinFactor + bankBonus * 1.25;
-      const effK = Math.max(0.0022, absK - 0.0038 * (1.0 - 0.55 * hairpinFactor));
-      const vCurv = Math.sqrt(a0 / effK);
-      rawSpeedsMs.push(THREE.MathUtils.clamp(vCurv, 18.5, 98.5));
-    }
-  }
-
-  const optSpeedsMs = [...rawSpeedsMs];
-  for (let pass = 0; pass < 3; pass++) {
-    for (let i = 0; i < NUM_SAMPLES; i++) {
-      const next = (i + 1) % NUM_SAMPLES;
-      const v = optSpeedsMs[i];
-      const maxAccel = v > 70 ? 7.5 : 13.5;
-      optSpeedsMs[next] = Math.min(
-        optSpeedsMs[next],
-        Math.sqrt(v * v + 2 * maxAccel * ds)
-      );
-    }
-    for (let i = NUM_SAMPLES - 1; i >= 0; i--) {
-      const prev = (i - 1 + NUM_SAMPLES) % NUM_SAMPLES;
-      const v = optSpeedsMs[i];
-      const maxBrakeDecel = 26.5 + 8.5 * Math.min(1.2, (v / 88.0) ** 2);
-      optSpeedsMs[prev] = Math.min(
-        optSpeedsMs[prev],
-        Math.sqrt(v * v + 2 * maxBrakeDecel * ds)
-      );
-    }
-  }
-
   const samples: TrackSamplePoint[] = [];
   for (let i = 0; i < NUM_SAMPLES; i++) {
     const s = i * ds;
     const t = i / NUM_SAMPLES;
-    const nextIdx = (i + 3) % NUM_SAMPLES;
-    const speedDrop = optSpeedsMs[i] - optSpeedsMs[nextIdx];
-    const brakingZone =
-      speedDrop > 4.2 ? 1.0 : speedDrop > 1.6 ? 0.5 : 0.0;
-
     const turnInfo = getTurnInfoAtS(s, totalLength);
     const absK = Math.abs(curvatures[i]);
 
@@ -754,11 +759,88 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
       kerbRight: absK > 0.004 || Math.abs(racingOffsetsNorm[i]) > 0.35,
       drsZone: isInDrsZone(t),
       racingLineOffset: racingOffsetsNorm[i],
-      optimalSpeedKmh: optSpeedsMs[i] * 3.6,
-      brakingZone,
+      optimalSpeedKmh: 0,
+      brakingZone: 0,
       gripMultiplier: grips[i],
     });
   }
+
+  // Target speeds along the AI line from the VF26 vehicle model (balanced aero package)
+  const nominalProfile = computeSpeedProfile(samples, createVf26ProfileCarModel('balanced'));
+  for (let i = 0; i < NUM_SAMPLES; i++) {
+    const speedDrop = nominalProfile.speedMs[i] - nominalProfile.speedMs[(i + 3) % NUM_SAMPLES];
+    samples[i].optimalSpeedKmh = nominalProfile.speedMs[i] * 3.6;
+    samples[i].brakingZone = speedDrop > 4.2 ? 1.0 : speedDrop > 1.6 ? 0.5 : 0.0;
+  }
+
+  // Horizontal centreline between samples: a periodic C2 cubic spline through the sample positions
+  // (uniform parameter u = s / ds). Lateral offsets measured from straight chords kink at every
+  // sample (≈5 cm sag at R = 50 m); a C1 Hermite with independently estimated tangents still made
+  // ds/dt jump by up to 18 % at some samples. Either turns the road slope under a wheel into a
+  // step every 4.4 m, i.e. a periodic vertical-velocity kick. The C2 spline keeps the parametric
+  // speed and curvature continuous across samples.
+  const splineDX = new Float64Array(NUM_SAMPLES);
+  const splineDZ = new Float64Array(NUM_SAMPLES);
+  {
+    // D[i−1] + 4·D[i] + D[i+1] = 3·(P[i+1] − P[i−1]); diagonally dominant, so Gauss-Seidel converges fast
+    const rhsX = new Float64Array(NUM_SAMPLES);
+    const rhsZ = new Float64Array(NUM_SAMPLES);
+    for (let i = 0; i < NUM_SAMPLES; i++) {
+      const pn = positions[(i + 1) % NUM_SAMPLES];
+      const pp = positions[(i - 1 + NUM_SAMPLES) % NUM_SAMPLES];
+      rhsX[i] = 3 * (pn.x - pp.x);
+      rhsZ[i] = 3 * (pn.z - pp.z);
+      splineDX[i] = rhsX[i] / 6;
+      splineDZ[i] = rhsZ[i] / 6;
+    }
+    for (let iter = 0; iter < 60; iter++) {
+      for (let i = 0; i < NUM_SAMPLES; i++) {
+        const ip = (i - 1 + NUM_SAMPLES) % NUM_SAMPLES;
+        const inx = (i + 1) % NUM_SAMPLES;
+        splineDX[i] = (rhsX[i] - splineDX[ip] - splineDX[inx]) / 4;
+        splineDZ[i] = (rhsZ[i] - splineDZ[ip] - splineDZ[inx]) / 4;
+      }
+    }
+  }
+  const hTanX = new Float64Array(NUM_SAMPLES);
+  const hTanZ = new Float64Array(NUM_SAMPLES);
+  for (let i = 0; i < NUM_SAMPLES; i++) {
+    const len = Math.hypot(splineDX[i], splineDZ[i]) || 1;
+    hTanX[i] = splineDX[i] / len;
+    hTanZ[i] = splineDZ[i] / len;
+  }
+  /** Spline centreline point (x, z), first and second derivative w.r.t. t on segment i0 → i0+1 */
+  const hermiteXZ = (i0: number, t: number) => {
+    const i1 = (i0 + 1) % NUM_SAMPLES;
+    const p0 = samples[i0].position;
+    const p1 = samples[i1].position;
+    const m0x = splineDX[i0];
+    const m0z = splineDZ[i0];
+    const m1x = splineDX[i1];
+    const m1z = splineDZ[i1];
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const h00 = 2 * t3 - 3 * t2 + 1;
+    const h10 = t3 - 2 * t2 + t;
+    const h01 = -2 * t3 + 3 * t2;
+    const h11 = t3 - t2;
+    const d00 = 6 * t2 - 6 * t;
+    const d10 = 3 * t2 - 4 * t + 1;
+    const d01 = -6 * t2 + 6 * t;
+    const d11 = 3 * t2 - 2 * t;
+    const e00 = 12 * t - 6;
+    const e10 = 6 * t - 4;
+    const e01 = -12 * t + 6;
+    const e11 = 6 * t - 2;
+    return {
+      x: h00 * p0.x + h10 * m0x + h01 * p1.x + h11 * m1x,
+      z: h00 * p0.z + h10 * m0z + h01 * p1.z + h11 * m1z,
+      dx: d00 * p0.x + d10 * m0x + d01 * p1.x + d11 * m1x,
+      dz: d00 * p0.z + d10 * m0z + d01 * p1.z + d11 * m1z,
+      ddx: e00 * p0.x + e10 * m0x + e01 * p1.x + e11 * m1x,
+      ddz: e00 * p0.z + e10 * m0z + e01 * p1.z + e11 * m1z,
+    };
+  };
 
   const getSampleAtDistance = (s: number): TrackSamplePoint => {
     const n = samples.length;
@@ -770,12 +852,16 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
 
     const s0 = samples[idx0];
     const s1 = samples[idx1];
+    const sPrev = samples[(idx0 - 1 + n) % n];
+    const sNext = samples[(idx1 + 1) % n];
 
     let interpYProf: number[] | undefined;
-    if (s0.yProf && s1.yProf && s0.yProf.length === s1.yProf.length) {
+    if (s0.yProf && s1.yProf && sPrev.yProf && sNext.yProf) {
+      const [w0, w1, w2, w3] = catmullRomWeights(alpha);
       interpYProf = new Array<number>(s0.yProf.length);
       for (let k = 0; k < s0.yProf.length; k++) {
-        interpYProf[k] = THREE.MathUtils.lerp(s0.yProf[k], s1.yProf[k], alpha);
+        interpYProf[k] =
+          w0 * sPrev.yProf[k] + w1 * s0.yProf[k] + w2 * s1.yProf[k] + w3 * sNext.yProf[k];
       }
     }
 
@@ -783,7 +869,12 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
       ...s0,
       s: wrappedS,
       t: wrappedS / totalLength,
-      position: s0.position.clone().lerp(s1.position, alpha),
+      position: (() => {
+        const hp = hermiteXZ(idx0, alpha);
+        const [w0, w1, w2, w3] = catmullRomWeights(alpha);
+        const y = w0 * sPrev.position.y + w1 * s0.position.y + w2 * s1.position.y + w3 * sNext.position.y;
+        return new THREE.Vector3(hp.x, y, hp.z);
+      })(),
       racingLinePos:
         s0.racingLinePos && s1.racingLinePos
           ? s0.racingLinePos.clone().lerp(s1.racingLinePos, alpha)
@@ -819,12 +910,61 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     };
   };
 
-  const projectWorldToTrackFn = (
-    worldX: number,
-    worldZ: number,
-    hintS?: number
-  ) => {
-    const n = samples.length;
+  // Horizontal unit tangents per sample, used by the continuous inverse mapping below
+  /**
+   * Solves for the parameter t on segment i0 → i0+1 at which the world point lies on the
+   * normal of the spline centreline, i.e. (P − C(t)) · C'(t) = 0. Returns t and the signed
+   * horizontal lateral offset (+ right).
+   */
+  const solveSegment = (worldX: number, worldZ: number, i0: number) => {
+    const i1 = (i0 + 1) % NUM_SAMPLES;
+    const a0 = samples[i0].position;
+    const a1 = samples[i1].position;
+    const dx = a1.x - a0.x;
+    const dz = a1.z - a0.z;
+    const rx = worldX - a0.x;
+    const rz = worldZ - a0.z;
+    const t0x = hTanX[i0];
+    const t0z = hTanZ[i0];
+    const ex = hTanX[i1] - t0x;
+    const ez = hTanZ[i1] - t0z;
+    // Initial guess from the chord with linearly interpolated normals: c + b·t + a·t² = 0
+    const c = rx * t0x + rz * t0z;
+    const b = rx * ex + rz * ez - (dx * t0x + dz * t0z);
+    const a = -(dx * ex + dz * ez);
+    let t = Math.abs(b) > 1e-9 ? -c / b : 0;
+    for (let k = 0; k < 3; k++) {
+      const df = b + 2 * a * t;
+      if (Math.abs(df) < 1e-9) break;
+      t -= (c + b * t + a * t * t) / df;
+    }
+    // Newton on f(t) = (P − C(t)) · C'(t) along the spline
+    let hp = hermiteXZ(i0, t);
+    for (let k = 0; k < 4; k++) {
+      const px = worldX - hp.x;
+      const pz = worldZ - hp.z;
+      const f = px * hp.dx + pz * hp.dz;
+      const df = -(hp.dx * hp.dx + hp.dz * hp.dz) + px * hp.ddx + pz * hp.ddz;
+      if (Math.abs(df) < 1e-9) break;
+      const step = THREE.MathUtils.clamp(f / df, -0.5, 0.5);
+      t -= step;
+      hp = hermiteXZ(i0, t);
+      if (Math.abs(step) < 1e-7) break;
+    }
+    const tLen = Math.hypot(hp.dx, hp.dz) || 1;
+    // Horizontal right = (−tz, tx)
+    const lateralH = ((worldX - hp.x) * -hp.dz + (worldZ - hp.z) * hp.dx) / tLen;
+    return { i0, i1, t, lateralH };
+  };
+
+  /**
+   * Locates a world XZ point on the track. Segment boundaries are the lines through each
+   * sample along its own normal, so (s, lateral) varies continuously with position.
+   * (Projecting onto the polyline chords instead leaves dead wedges on the outside of every
+   * bend where s stalls, which shows up as millimetre road-height steps at each sample.)
+   */
+  const locateWorldPointFn = (worldX: number, worldZ: number, hintS?: number) => {
+    const n = NUM_SAMPLES;
     let bestIdx = 0;
     let bestDistSq = Infinity;
 
@@ -835,9 +975,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
       for (let offset = -searchRadius; offset <= searchRadius; offset++) {
         const idx = (centerIdx + offset + n) % n;
         const p = samples[idx].position;
-        const dx = worldX - p.x;
-        const dz = worldZ - p.z;
-        const dSq = dx * dx + dz * dz;
+        const dSq = (worldX - p.x) ** 2 + (worldZ - p.z) ** 2;
         if (dSq < bestDistSq) {
           bestDistSq = dSq;
           bestIdx = idx;
@@ -849,9 +987,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
       bestDistSq = Infinity;
       for (let i = 0; i < n; i++) {
         const p = samples[i].position;
-        const dx = worldX - p.x;
-        const dz = worldZ - p.z;
-        const dSq = dx * dx + dz * dz;
+        const dSq = (worldX - p.x) ** 2 + (worldZ - p.z) ** 2;
         if (dSq < bestDistSq) {
           bestDistSq = dSq;
           bestIdx = i;
@@ -859,50 +995,46 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
       }
     }
 
-    const prevIdx = (bestIdx - 1 + n) % n;
-    const nextIdx = (bestIdx + 1) % n;
+    // The containing segment touches the nearest sample except far off-line in tight bends
+    let chosen: ReturnType<typeof solveSegment> | null = null;
+    let fallback: ReturnType<typeof solveSegment> | null = null;
+    let fallbackOut = Infinity;
+    for (const off of [-1, 0, -2, 1]) {
+      const seg = solveSegment(worldX, worldZ, (bestIdx + off + n) % n);
+      if (seg.t >= 0 && seg.t <= 1) {
+        if (!chosen || Math.abs(seg.lateralH) < Math.abs(chosen.lateralH)) chosen = seg;
+      } else {
+        const out = seg.t < 0 ? -seg.t : seg.t - 1;
+        if (out < fallbackOut) {
+          fallbackOut = out;
+          fallback = seg;
+        }
+      }
+      if (chosen && off === 0) break;
+    }
+    if (!chosen) {
+      chosen = solveSegment(worldX, worldZ, fallback!.i0);
+      chosen.t = THREE.MathUtils.clamp(chosen.t, 0, 1);
+    }
+    const s = ((((chosen.i0 + chosen.t) * ds) % totalLength) + totalLength) % totalLength;
+    return { ...chosen, s };
+  };
 
-    const projectSeg = (idxA: number, idxB: number) => {
-      const pA = samples[idxA].position;
-      const pB = samples[idxB].position;
-      const vx = pB.x - pA.x;
-      const vz = pB.z - pA.z;
-      const lenSq = vx * vx + vz * vz;
-      const alpha =
-        lenSq > 1e-6
-          ? THREE.MathUtils.clamp(
-              ((worldX - pA.x) * vx + (worldZ - pA.z) * vz) / lenSq,
-              0,
-              1
-            )
-          : 0;
-      const projX = pA.x + alpha * vx;
-      const projZ = pA.z + alpha * vz;
-      const dSq = (worldX - projX) ** 2 + (worldZ - projZ) ** 2;
-      const sVal =
-        (((idxA * ds + alpha * ds) % totalLength) + totalLength) % totalLength;
-      return { dSq, sVal };
-    };
-
-    const segPrev = projectSeg(prevIdx, bestIdx);
-    const segNext = projectSeg(bestIdx, nextIdx);
-    const chosen = segPrev.dSq < segNext.dSq ? segPrev : segNext;
-
-    const sample = getSampleAtDistance(chosen.sVal);
-    const relX = worldX - sample.position.x;
-    const relZ = worldZ - sample.position.z;
+  const projectWorldToTrackFn = (
+    worldX: number,
+    worldZ: number,
+    hintS?: number
+  ) => {
+    const loc = locateWorldPointFn(worldX, worldZ, hintS);
+    const sample = getSampleAtDistance(loc.s);
     const bHorizLen = Math.hypot(sample.binormal.x, sample.binormal.z) || 1;
-    const bx = sample.binormal.x / bHorizLen;
-    const bz = sample.binormal.z / bHorizLen;
     // Account for binormal 3D tilt (cos(bankingRad)) so position + binormal * lateralOffset matches XZ
     const cosBank = Math.max(0.85, bHorizLen);
-    const lateralOffset = (relX * bx + relZ * bz) / cosBank;
-
     return {
       sample,
-      s: chosen.sVal,
-      lateralOffset,
-      distSq: chosen.dSq,
+      s: loc.s,
+      lateralOffset: loc.lateralH / cosBank,
+      distSq: loc.lateralH * loc.lateralH,
     };
   };
 
@@ -913,6 +1045,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     spline,
     getSampleAtDistance,
     projectWorldToTrack: projectWorldToTrackFn,
+    locateWorldPoint: locateWorldPointFn,
   };
 
   return cachedBuiltTrack;

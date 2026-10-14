@@ -433,7 +433,7 @@ export const F1TelemetryHud: React.FC<F1TelemetryHudProps> = ({
             <p className="mt-0.5 text-[10px] leading-snug text-zinc-400 line-clamp-2">
               {currentTurnMeta
                 ? currentTurnMeta.description
-                : "Thin 1,400m altitude air (-15% drag) enables ±350 km/h top speeds in 2026 X-Mode."}
+                : "Thin 1,400m altitude air (ρ≈1.07, −13% drag) lets the VF26 reach ≈330 km/h in 2026 X-Mode."}
             </p>
           </div>
         </div>
@@ -645,7 +645,7 @@ export const F1TelemetryHud: React.FC<F1TelemetryHudProps> = ({
                   2026 F1 AERO & POWERTRAIN SETUP (1,400M)
                 </span>
                 <span className="font-f1-mono text-[10px] text-zinc-400">
-                  768 KG • 400KW ICE + 350KW MGU-K
+                  768 KG • ~540KW ICE + 350KW MGU-K
                 </span>
               </div>
 
@@ -658,18 +658,18 @@ export const F1TelemetryHud: React.FC<F1TelemetryHudProps> = ({
                     [
                       {
                         id: "low_downforce",
-                        title: "Low Downforce ★",
-                        sub: "352 km/h Top Speed",
+                        title: "Low Downforce",
+                        sub: "≈338 km/h X-Mode • Low Drag",
                       },
                       {
                         id: "balanced",
-                        title: "Balanced",
-                        sub: "342 km/h • +9% Grip",
+                        title: "Balanced ★",
+                        sub: "≈331 km/h X-Mode",
                       },
                       {
                         id: "high_downforce",
                         title: "High Downforce",
-                        sub: "332 km/h • Max Apex",
+                        sub: "≈324 km/h X-Mode • Max Grip",
                       },
                     ] as const
                   ).map((item) => (
@@ -725,8 +725,8 @@ export const F1TelemetryHud: React.FC<F1TelemetryHudProps> = ({
                     {(
                       [
                         { id: "pro", label: "Sim Raw" },
-                        { id: "semi_pro", label: "Med TC" },
-                        { id: "assisted", label: "Full TC" },
+                        { id: "semi_pro", label: "TC+ABS" },
+                        { id: "assisted", label: "Full" },
                       ] as const
                     ).map((a) => (
                       <button

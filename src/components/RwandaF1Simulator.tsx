@@ -22,6 +22,25 @@ import type {
   TireCompound,
 } from "@/types/f1";
 
+/** Matches the aero package the track's target speeds / braking markers are computed for */
+const DEFAULT_AERO_PRESET: AeroSetupPreset = "balanced";
+const DEFAULT_ASSIST_PRESET: AssistPreset = "semi_pro";
+
+// Keyboard-only input shaping: a key press becomes a pedal squeeze, not a step
+const KB_THROTTLE_RISE_S = 0.25;
+const KB_THROTTLE_FALL_S = 0.1;
+const KB_BRAKE_RISE_S = 0.17;
+const KB_BRAKE_FALL_S = 0.08;
+/** Time for keyboard steering to reach its speed-dependent limit, and to recentre */
+const KB_STEER_RISE_S = 0.3;
+const KB_STEER_RETURN_S = 0.18;
+/** Keyboard steering limit: road-wheel angle for this lateral acceleration (m/s²) plus a peak slip allowance (rad) */
+const KB_STEER_LIMIT_ACCEL = 38;
+const KB_STEER_LIMIT_SLIP_RAD = 0.12;
+
+const approach = (value: number, target: number, maxStep: number) =>
+  value + Math.max(-maxStep, Math.min(maxStep, target - value));
+
 export const RwandaF1Simulator: React.FC = () => {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -38,8 +57,10 @@ export const RwandaF1Simulator: React.FC = () => {
   });
 
   const [aeroPreset, setAeroPreset] =
-    useState<AeroSetupPreset>("low_downforce");
-  const [assistPreset, setAssistPreset] = useState<AssistPreset>("pro");
+    useState<AeroSetupPreset>(DEFAULT_AERO_PRESET);
+  const [assistPreset, setAssistPreset] = useState<AssistPreset>(
+    DEFAULT_ASSIST_PRESET
+  );
   const [cameraMode, setCameraMode] = useState<CameraMode>("chase");
   const [tireCompound, setTireCompound] = useState<TireCompound>("soft");
   const [selectedLivery, setSelectedLivery] = useState<LiveryConfig>(
@@ -88,6 +109,8 @@ export const RwandaF1Simulator: React.FC = () => {
     shiftDown: false,
     toggleX: false,
   });
+  /** Shaped keyboard inputs (pedals 0..1, steering -1..1, + = right) */
+  const kbInputRef = useRef({ throttle: 0, brake: 0, steer: 0 });
 
   const unlockAudio = useCallback(() => {
     if (!audioRef.current) {
@@ -235,7 +258,8 @@ export const RwandaF1Simulator: React.FC = () => {
 
     const physics = new F1Physics2026(track);
     physics.aiAutopilot = false;
-    physics.assistPreset = "pro";
+    physics.assistPreset = DEFAULT_ASSIST_PRESET;
+    physics.aeroPreset = DEFAULT_AERO_PRESET;
     physics.resetToStartGrid(false);
     physicsRef.current = physics;
 
@@ -570,18 +594,49 @@ export const RwandaF1Simulator: React.FC = () => {
         }
       }
 
-      const isKeyboardSteerOverride =
-        keysRef.current.left || keysRef.current.right;
+      // Keyboard-only input shaping: keys become ramped pedals and a rate- and speed-limited
+      // steering angle (about what keeps the front tyres near peak slip at this speed).
+      // Gamepad, wheel and mouse inputs are passed through untouched.
+      const keys = keysRef.current;
+      const kb = kbInputRef.current;
+      kb.throttle = approach(
+        kb.throttle,
+        keys.up ? 1 : 0,
+        dtSeconds / (keys.up ? KB_THROTTLE_RISE_S : KB_THROTTLE_FALL_S)
+      );
+      kb.brake = approach(
+        kb.brake,
+        keys.down ? 1 : 0,
+        dtSeconds / (keys.down ? KB_BRAKE_RISE_S : KB_BRAKE_FALL_S)
+      );
+      const vFwd = Math.max(0, physics.vxMs);
+      const kbSteerLimit = Math.min(
+        1,
+        ((physics.wheelbaseM * KB_STEER_LIMIT_ACCEL) / Math.max(1, vFwd * vFwd) +
+          KB_STEER_LIMIT_SLIP_RAD) /
+          physics.maxSteerAngleRad
+      );
+      const kbSteerTarget =
+        ((keys.right ? 1 : 0) - (keys.left ? 1 : 0)) * kbSteerLimit;
+      const kbRecentring =
+        kbSteerTarget === 0 || kbSteerTarget * kb.steer < 0;
+      kb.steer = approach(
+        kb.steer,
+        kbSteerTarget,
+        (kbSteerLimit / (kbRecentring ? KB_STEER_RETURN_S : KB_STEER_RISE_S)) *
+          dtSeconds
+      );
+      const kbSteerActive = keys.left || keys.right || Math.abs(kb.steer) > 1e-3;
       const activeAnalogSteer = mouseSteerEnabledRef.current
         ? mouseSteerValueRef.current
         : gamepadSteer;
 
       const inputs: ControlInputs = {
-        throttle: Math.max(keysRef.current.up ? 1 : 0, gamepadThrottle),
-        brake: Math.max(keysRef.current.down ? 1 : 0, gamepadBrake),
-        steerLeft: keysRef.current.left ? 1 : 0,
-        steerRight: keysRef.current.right ? 1 : 0,
-        analogSteer: isKeyboardSteerOverride ? undefined : activeAnalogSteer,
+        throttle: Math.max(kb.throttle, gamepadThrottle),
+        brake: Math.max(kb.brake, gamepadBrake),
+        steerLeft: 0,
+        steerRight: 0,
+        analogSteer: kbSteerActive ? kb.steer : activeAnalogSteer,
         manualOverride:
           keysRef.current.boostHold || boostLatchRef.current || gamepadBoost,
         toggleXMode: keysRef.current.toggleX,
@@ -655,8 +710,8 @@ export const RwandaF1Simulator: React.FC = () => {
 
       // Keep mouseSteerValueRef synchronized with actual steering angle while keyboard A/D override is held
       // so releasing A/D mid-corner at 300+ km/h transitions seamlessly without a step jump
-      if (mouseSteerEnabledRef.current && isKeyboardSteerOverride) {
-        mouseSteerValueRef.current = physics.steerAngleNorm;
+      if (mouseSteerEnabledRef.current && kbSteerActive) {
+        mouseSteerValueRef.current = kb.steer;
       }
 
       // Auto-disengage latched /boost if ERS battery is completely depleted
