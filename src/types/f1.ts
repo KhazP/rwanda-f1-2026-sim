@@ -102,6 +102,7 @@ export interface TrackSamplePoint {
   optimalSpeedKmh: number; // Computed physics target speed at this point
   brakingZone: number; // 0 = throttle, 0.5 = lift/coast, 1 = heavy braking
   gripMultiplier?: number;
+  yProf?: number[]; // 9-point lateral elevation profile across [-12, -8, -5, -2.5, 0, 2.5, 5, 8, 12]m
 }
 
 

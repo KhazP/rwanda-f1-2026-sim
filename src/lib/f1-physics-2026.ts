@@ -28,6 +28,7 @@ export type { ControlInputs };
 import {
   BASE_ALTITUDE_M,
   type BuiltTrackData,
+  evaluateSampleLateralHeightM,
   getRwandaTrackData,
   TRACK_TOTAL_LENGTH_M,
 } from './track-data';
@@ -1155,9 +1156,8 @@ export class F1Physics2026 {
    * Computes the 3D world positions of all 4 wheels from the current chassis pose.
    */
   private updateWheelWorldPositions(sample: ReturnType<BuiltTrackData['getSampleAtDistance']>): void {
-    const carPos = sample.position
-      .clone()
-      .addScaledVector(sample.binormal, this.lateralOffsetM);
+    const carGroundY = evaluateSampleLateralHeightM(sample, this.lateralOffsetM);
+    const carPos = new THREE.Vector3(this.worldX, carGroundY, this.worldZ);
 
     const carUp = sample.normal.clone().normalize();
     const hx = Math.sin(this.worldYawRad);
@@ -1493,12 +1493,19 @@ export class F1Physics2026 {
 
   private syncWorldTransform(): void {
     const sample = this.track.getSampleAtDistance(this.sMeters);
+    const exactGroundY = evaluateSampleLateralHeightM(sample, this.lateralOffsetM);
 
-    this.worldPosition
-      .copy(sample.position)
-      .addScaledVector(sample.binormal, this.lateralOffsetM);
+    this.worldPosition.set(this.worldX, exactGroundY, this.worldZ);
 
-    const carUp = sample.normal.clone().normalize();
+    // Derive surface normal from local lateral slope across the car's track width and longitudinal slope
+    const yLeft = evaluateSampleLateralHeightM(sample, this.lateralOffsetM - 0.8);
+    const yRight = evaluateSampleLateralHeightM(sample, this.lateralOffsetM + 0.8);
+    const localBankRad = Math.atan2(yLeft - yRight, 1.6);
+
+    const rightFlat = new THREE.Vector3(-sample.tangent.z, 0, sample.tangent.x).normalize();
+    const upFlat = new THREE.Vector3().crossVectors(rightFlat, sample.tangent).normalize();
+    const carUp = upFlat.applyAxisAngle(sample.tangent, localBankRad).normalize();
+
     const hx = Math.sin(this.worldYawRad);
     const hz = Math.cos(this.worldYawRad);
     const fy =

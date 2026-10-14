@@ -11,7 +11,7 @@
 
 import * as THREE from 'three';
 import { SurfaceType, TrackSamplePoint } from '@/types/f1';
-import { BuiltTrackData } from '@/lib/track-data';
+import { BuiltTrackData, evaluateSampleLateralHeightM } from '@/lib/track-data';
 
 export const CURV_LOOK_AHEAD_DISTANCE = 300; // meters (from assetto_corsa_gym ac_env.py)
 export const CURV_LOOK_AHEAD_VECTOR_SIZE = 12; // 12 lookahead samples
@@ -115,16 +115,15 @@ export function queryWheelGroundContact(
   const relZ = worldZ - s0.position.z;
   const t = Math.max(0, Math.min(1, (relX * segX + relZ * segZ) / segLenSq));
 
-  // Interpolated center point & binormal
+  // Interpolated center point & horizontal binormal
   const cx = s0.position.x + segX * t;
-  const cy = s0.position.y + (sNext.position.y - s0.position.y) * t;
   const cz = s0.position.z + segZ * t;
 
   const bx = s0.binormal.x + (sNext.binormal.x - s0.binormal.x) * t;
   const bz = s0.binormal.z + (sNext.binormal.z - s0.binormal.z) * t;
   const bLen = Math.hypot(bx, bz) || 1;
 
-  // Signed lateral offset from track centerline (+right along binormal, -left)
+  // Signed lateral offset from track centerline (+right along horizontal binormal, -left)
   const lateralOffsetM = ((worldX - cx) * bx + (worldZ - cz) * bz) / bLen;
   const absLat = Math.abs(lateralOffsetM);
 
@@ -133,8 +132,10 @@ export function queryWheelGroundContact(
   const slopeSin = s0.slopeSin + (sNext.slopeSin - s0.slopeSin) * t;
   const pitchSlopeRad = Math.asin(THREE.MathUtils.clamp(slopeSin, -0.5, 0.5));
 
-  // Road height at wheel lateral position accounting for track banking (inside of banked turn is lower)
-  const zRoad = cy - Math.sin(bankRad) * lateralOffsetM;
+  // Exact KN5 3D surface elevation at wheel lateral position interpolated from the 9-point cross-section profile
+  const z0 = evaluateSampleLateralHeightM(s0, lateralOffsetM);
+  const z1 = evaluateSampleLateralHeightM(sNext, lateralOffsetM);
+  const zRoad = z0 + (z1 - z0) * t;
 
   // Classify surface under this specific wheel (asphalt, kerb, runoff, grass)
   const kerbInner = halfWidthM - 0.35;

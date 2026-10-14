@@ -442,6 +442,43 @@ export const RWANDA_CONTROL_POINTS: TrackControlPoint[] = rawTrackJson.samples
 
 let cachedBuiltTrack: BuiltTrackData | null = null;
 
+export const LAT_PROFILE_OFFSETS = [-12, -8, -5, -2.5, 0, 2.5, 5, 8, 12] as const;
+
+/**
+ * Evaluates the exact 3D KN5 surface height `y` at a signed lateral offset `lateralOffsetM`
+ * (`-left .. +right` along horizontal track binormal) for a `TrackSamplePoint`.
+ */
+export function evaluateSampleLateralHeightM(
+  sample: TrackSamplePoint,
+  lateralOffsetM: number
+): number {
+  const yp = sample.yProf;
+  if (!yp || yp.length !== LAT_PROFILE_OFFSETS.length) {
+    return sample.position.y - Math.sin(sample.bankingRad) * lateralOffsetM;
+  }
+  const n = LAT_PROFILE_OFFSETS.length;
+  if (lateralOffsetM <= LAT_PROFILE_OFFSETS[0]) {
+    const slopeLeft =
+      (yp[1] - yp[0]) / (LAT_PROFILE_OFFSETS[1] - LAT_PROFILE_OFFSETS[0]);
+    return yp[0] + slopeLeft * (lateralOffsetM - LAT_PROFILE_OFFSETS[0]);
+  }
+  if (lateralOffsetM >= LAT_PROFILE_OFFSETS[n - 1]) {
+    const slopeRight =
+      (yp[n - 1] - yp[n - 2]) /
+      (LAT_PROFILE_OFFSETS[n - 1] - LAT_PROFILE_OFFSETS[n - 2]);
+    return yp[n - 1] + slopeRight * (lateralOffsetM - LAT_PROFILE_OFFSETS[n - 1]);
+  }
+  for (let k = 0; k < n - 1; k++) {
+    const l0 = LAT_PROFILE_OFFSETS[k];
+    const l1 = LAT_PROFILE_OFFSETS[k + 1];
+    if (lateralOffsetM >= l0 && lateralOffsetM <= l1) {
+      const alpha = (lateralOffsetM - l0) / (l1 - l0);
+      return yp[k] + (yp[k + 1] - yp[k]) * alpha;
+    }
+  }
+  return sample.position.y;
+}
+
 export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
   if (cachedBuiltTrack && cachedBuiltTrack.samples.length === numSamples) {
     return cachedBuiltTrack;
@@ -461,6 +498,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
 
   const positions: THREE.Vector3[] = [];
   const racingPositions: THREE.Vector3[] = [];
+  const yProfs: number[][] = [];
   const widths: number[] = [];
   const bankings: number[] = [];
   const grips: number[] = [];
@@ -475,20 +513,20 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     ) {
       rawIdx++;
     }
-    const r0 = rawSamples[rawIdx];
-    const r1 = rawSamples[(rawIdx + 1) % rawCount];
+    const r0 = rawSamples[rawIdx] as typeof rawSamples[0] & { yProf?: number[] };
+    const r1 = rawSamples[(rawIdx + 1) % rawCount] as typeof rawSamples[0] & {
+      yProf?: number[];
+    };
     const s0 = r0.s;
     const s1 = rawIdx + 1 < rawCount ? r1.s : totalLength;
     const span = Math.max(0.001, s1 - s0);
     const alpha = THREE.MathUtils.clamp((targetS - s0) / span, 0, 1);
 
-    positions.push(
-      new THREE.Vector3(
-        THREE.MathUtils.lerp(r0.p[0], r1.p[0], alpha),
-        THREE.MathUtils.lerp(r0.p[1], r1.p[1], alpha),
-        THREE.MathUtils.lerp(r0.p[2], r1.p[2], alpha)
-      )
-    );
+    const cx = THREE.MathUtils.lerp(r0.p[0], r1.p[0], alpha);
+    const cy = THREE.MathUtils.lerp(r0.p[1], r1.p[1], alpha);
+    const cz = THREE.MathUtils.lerp(r0.p[2], r1.p[2], alpha);
+    positions.push(new THREE.Vector3(cx, cy, cz));
+
     racingPositions.push(
       new THREE.Vector3(
         THREE.MathUtils.lerp(r0.r[0], r1.r[0], alpha),
@@ -498,13 +536,26 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     );
     widths.push(THREE.MathUtils.lerp(r0.w, r1.w, alpha));
 
-    const turnInfo = getTurnInfoAtS(targetS, totalLength);
     const meshBank = THREE.MathUtils.lerp(r0.b, r1.b, alpha);
-    const combinedBank =
-      turnInfo.minBankRad >= 0
-        ? Math.max(meshBank, turnInfo.minBankRad)
-        : Math.min(meshBank, turnInfo.minBankRad);
-    bankings.push(combinedBank);
+    bankings.push(meshBank);
+
+    if (
+      r0.yProf &&
+      r1.yProf &&
+      r0.yProf.length === LAT_PROFILE_OFFSETS.length &&
+      r1.yProf.length === LAT_PROFILE_OFFSETS.length
+    ) {
+      const yp = new Array<number>(LAT_PROFILE_OFFSETS.length);
+      for (let k = 0; k < LAT_PROFILE_OFFSETS.length; k++) {
+        yp[k] = THREE.MathUtils.lerp(r0.yProf[k], r1.yProf[k], alpha);
+      }
+      yProfs.push(yp);
+    } else {
+      yProfs.push(
+        LAT_PROFILE_OFFSETS.map((lat) => cy - Math.sin(meshBank) * lat)
+      );
+    }
+
     grips.push(THREE.MathUtils.lerp(r0.g ?? 1.0, r1.g ?? 1.0, alpha));
     const v0 = (r0 as { v?: number }).v ?? 315;
     const v1 = (r1 as { v?: number }).v ?? 315;
@@ -512,7 +563,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
   }
 
   // Ensure the starting grid straight (s = 0..195m, already collinear within 1.2 cm in the KN5 road mesh)
-  // has an exact collinear horizontal chord so pure 3D Cartesian straight-line acceleration has zero sub-millimeter lateral/heading noise
+  // has an exact collinear horizontal XZ chord so pure 3D Cartesian straight-line acceleration has zero sub-centimeter lateral/heading noise
   const idxStart = Math.round(15 / ds);
   const idxEnd = Math.round(195 / ds);
   const pStart = positions[idxStart].clone();
@@ -534,7 +585,6 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
       const lineZ = pStart.z + projDist * uz;
       positions[i].x = THREE.MathUtils.lerp(positions[i].x, lineX, blend);
       positions[i].z = THREE.MathUtils.lerp(positions[i].z, lineZ, blend);
-      bankings[i] *= 1.0 - blend;
     }
   }
 
@@ -687,6 +737,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
       t,
       position: positions[i],
       racingLinePos: racingPositions[i],
+      yProf: yProfs[i],
       tangent: tangents[i],
       normal: normals[i],
       binormal: binormals[i],
@@ -720,6 +771,14 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     const s0 = samples[idx0];
     const s1 = samples[idx1];
 
+    let interpYProf: number[] | undefined;
+    if (s0.yProf && s1.yProf && s0.yProf.length === s1.yProf.length) {
+      interpYProf = new Array<number>(s0.yProf.length);
+      for (let k = 0; k < s0.yProf.length; k++) {
+        interpYProf[k] = THREE.MathUtils.lerp(s0.yProf[k], s1.yProf[k], alpha);
+      }
+    }
+
     return {
       ...s0,
       s: wrappedS,
@@ -729,6 +788,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
         s0.racingLinePos && s1.racingLinePos
           ? s0.racingLinePos.clone().lerp(s1.racingLinePos, alpha)
           : undefined,
+      yProf: interpYProf,
       tangent: s0.tangent.clone().lerp(s1.tangent, alpha).normalize(),
       normal: s0.normal.clone().lerp(s1.normal, alpha).normalize(),
       binormal: s0.binormal.clone().lerp(s1.binormal, alpha).normalize(),

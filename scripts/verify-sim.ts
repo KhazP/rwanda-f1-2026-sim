@@ -465,14 +465,13 @@ async function runVerification() {
   );
 
   // 9.3 Exact Tire-to-Track Ground Contact & Unsprung Wheel Separation
+  const { evaluateSampleLateralHeightM } = await import('../src/lib/track-data');
   const sampleAtCar = track.getSampleAtDistance(simCorner.sMeters);
-  const expectedSurfacePos = sampleAtCar.position
-    .clone()
-    .addScaledVector(sampleAtCar.binormal, simCorner.lateralOffsetM);
-  const groundContactError = simCorner.worldPosition.distanceTo(expectedSurfacePos);
+  const expectedGroundY = evaluateSampleLateralHeightM(sampleAtCar, simCorner.lateralOffsetM);
+  const groundContactError = Math.abs(simCorner.worldPosition.y - expectedGroundY);
   assert(
     groundContactError < 1e-5,
-    `Car root worldPosition sits flush on track surface with zero floating offset (error=${groundContactError.toExponential(2)}m)`
+    `Car root worldPosition sits flush on KN5 track surface profile with zero floating offset (error=${groundContactError.toExponential(2)}m)`
   );
 
   const { createF1Car2026 } = await import('../src/lib/car-builder-2026');

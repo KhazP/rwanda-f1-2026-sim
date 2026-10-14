@@ -504,18 +504,32 @@ const baseKn5 = parseKn5(path.join(AC_TRACK_DIR, 'Rwanda_International.kn5'));
 const ext2026Kn5 = parseKn5(path.join(AC_TRACK_DIR, 'Rwanda_International_2026.kn5'));
 
 // ---------------------------------------------------------------------------
-// 4. Build Exact Surface Height Sampler from 1ROAD0_SUB0, 1TARMAC0, 1KERB*
+// 4. Build Exact Surface Height Sampler from ALL Ground Meshes
+//    (1ROAD*, 1TARMAC*, 1PIT*, 1KERB*, 1OFFTRACK*, 1GRASS*, 1SAND*)
 // ---------------------------------------------------------------------------
 const roadVerts = [];
 const roadTris = [];
 
 for (const mesh of baseKn5.meshes) {
-  const isRoad = mesh.name.includes('ROAD');
-  const isTarmac = mesh.name.includes('TARMAC') || mesh.name.includes('PIT');
-  const isKerb = mesh.name.includes('KERB');
-  if (!isRoad && !isTarmac && !isKerb) continue;
+  const isRoad = mesh.name.includes('1ROAD');
+  const isTarmac = mesh.name.includes('1TARMAC') || mesh.name.includes('1PIT');
+  const isKerb = mesh.name.includes('1KERB');
+  const isOfftrack = mesh.name.includes('1OFFTRACK');
+  const isGrassOrSand = mesh.name.includes('1GRASS') || mesh.name.includes('1SAND');
+  if (!isRoad && !isTarmac && !isKerb && !isOfftrack && !isGrassOrSand) continue;
 
-  const prio = mesh.name === '1ROAD0_SUB0' ? 0 : isTarmac ? 1 : isRoad ? 2 : 3;
+  const prio =
+    mesh.name === '1ROAD0_SUB0'
+      ? 0
+      : isTarmac
+        ? 1
+        : isRoad
+          ? 2
+          : isKerb
+            ? 3
+            : isOfftrack
+              ? 4
+              : 5;
   const baseV = roadVerts.length;
   const { buf, vByteStart, vCount, iByteStart, iCount, worldMatrix } = mesh;
 
@@ -592,11 +606,11 @@ function sampleRoadHeightAtXZ(x, z, hintY) {
         if (Math.abs(denom) < 1e-8) continue;
         const u = (v2x * v1z - v1x * v2z) / denom;
         const v = (v0x * v2z - v2x * v0z) / denom;
-        if (u >= -0.08 && v >= -0.08 && u + v <= 1.08) {
+        if (u >= -0.04 && v >= -0.04 && u + v <= 1.04) {
           const y = a[1] + u * (b[1] - a[1]) + v * (c[1] - a[1]);
           const yDiff = Math.abs(y - hintY);
-          if (yDiff > 3.0) continue;
-          const score = prio * 0.04 + yDiff;
+          if (yDiff > 4.5) continue;
+          const score = prio * 0.03 + yDiff;
           if (score < bestScore) {
             bestScore = score;
             bestY = y;
@@ -750,29 +764,72 @@ for (let i = 0; i < numAiPoints; i++) {
 }
 
 const STEP = 3;
-const trackSamples = [];
+const rawCenters = [];
 for (let i = 0; i < numAiPoints; i += STEP) {
   const pt = rawAi[i];
   const shift = smoothShift[i];
-  const width = smoothWidth[i];
+  rawCenters.push({
+    aiIdx: i,
+    cxRaw: pt.x + pt.rx * shift,
+    czRaw: pt.z + pt.rz * shift,
+  });
+}
 
-  const cxRaw = pt.x + pt.rx * shift;
-  const czRaw = pt.z + pt.rz * shift;
+// Compute exact centerline horizontal right-vector (rx, rz) from centerline positions
+const LAT_PROFILE_OFFSETS = [-12, -8, -5, -2.5, 0, 2.5, 5, 8, 12];
+const trackSamples = [];
+const numSamplePts = rawCenters.length;
+
+for (let idx = 0; idx < numSamplePts; idx++) {
+  const { aiIdx, cxRaw, czRaw } = rawCenters[idx];
+  const prevC = rawCenters[(idx - 1 + numSamplePts) % numSamplePts];
+  const nextC = rawCenters[(idx + 1) % numSamplePts];
+  const tx = nextC.cxRaw - prevC.cxRaw;
+  const tz = nextC.czRaw - prevC.czRaw;
+  const tLen = Math.hypot(tx, tz) || 1;
+  const rx = -tz / tLen;
+  const rz = tx / tLen;
+
+  const pt = rawAi[aiIdx];
+  const shift = smoothShift[aiIdx];
+  const width = smoothWidth[aiIdx];
   const rxRaw = pt.x;
   const rzRaw = pt.z;
 
   const raceHit = sampleRoadHeightAtXZ(rxRaw, rzRaw, pt.y);
   const ryRaw = raceHit.y !== null ? raceHit.y : pt.y - 0.23;
 
-  const centerHit = sampleRoadHeightAtXZ(cxRaw, czRaw, pt.y);
+  const centerHit = sampleRoadHeightAtXZ(cxRaw, czRaw, ryRaw);
   const cyRaw = centerHit.y !== null ? centerHit.y : ryRaw;
 
-  const leftHit = sampleRoadHeightAtXZ(cxRaw - pt.rx * 4.0, czRaw - pt.rz * 4.0, cyRaw);
-  const rightHit = sampleRoadHeightAtXZ(cxRaw + pt.rx * 4.0, czRaw + pt.rz * 4.0, cyRaw);
+  const leftHit = sampleRoadHeightAtXZ(cxRaw - rx * 4.5, czRaw - rz * 4.5, cyRaw);
+  const rightHit = sampleRoadHeightAtXZ(cxRaw + rx * 4.5, czRaw + rz * 4.5, cyRaw);
   let banking = 0;
   if (leftHit.y !== null && rightHit.y !== null) {
-    banking = Math.atan2(leftHit.y - rightHit.y, 8.0);
-    banking = Math.max(-0.12, Math.min(0.12, banking));
+    banking = Math.atan2(leftHit.y - rightHit.y, 9.0);
+    banking = Math.max(-0.18, Math.min(0.18, banking));
+  }
+
+  // Sample exact 9-point lateral elevation profile across [-12, -8, -5, -2.5, 0, 2.5, 5, 8, 12]m
+  const yProf = new Array(LAT_PROFILE_OFFSETS.length);
+  yProf[4] = Number((cyRaw - ORIGIN_Y).toFixed(3));
+  // Outward to the left (-2.5, -5, -8, -12)
+  let prevLeftY = cyRaw;
+  for (let k = 3; k >= 0; k--) {
+    const lat = LAT_PROFILE_OFFSETS[k];
+    const hit = sampleRoadHeightAtXZ(cxRaw + rx * lat, czRaw + rz * lat, prevLeftY);
+    const valY = hit.y !== null ? hit.y : cyRaw - Math.sin(banking) * lat;
+    prevLeftY = valY;
+    yProf[k] = Number((valY - ORIGIN_Y).toFixed(3));
+  }
+  // Outward to the right (+2.5, +5, +8, +12)
+  let prevRightY = cyRaw;
+  for (let k = 5; k < LAT_PROFILE_OFFSETS.length; k++) {
+    const lat = LAT_PROFILE_OFFSETS[k];
+    const hit = sampleRoadHeightAtXZ(cxRaw + rx * lat, czRaw + rz * lat, prevRightY);
+    const valY = hit.y !== null ? hit.y : cyRaw - Math.sin(banking) * lat;
+    prevRightY = valY;
+    yProf[k] = Number((valY - ORIGIN_Y).toFixed(3));
   }
 
   const racingLineOffset = -shift;
@@ -789,6 +846,7 @@ for (let i = 0; i < numAiPoints; i += STEP) {
       Number((ryRaw - ORIGIN_Y).toFixed(3)),
       Number((rzRaw - ORIGIN_Z).toFixed(3)),
     ],
+    yProf,
     ro: Number(racingLineOffset.toFixed(3)),
     w: Number(width.toFixed(2)),
     b: Number(banking.toFixed(4)),
@@ -823,6 +881,7 @@ const trackDataJson = {
     geotags: uiTrack.geotags || [],
     author: uiTrack.author || 'Assetto Corsa Rwanda International',
     originOffset: [ORIGIN_X, ORIGIN_Y, ORIGIN_Z],
+    latProfileOffsets: LAT_PROFILE_OFFSETS,
     surfaces: {
       roadGrip: parseFloat(surfIni.SURFACE_0?.FRICTION || '1.0'),
       tarmacGrip: parseFloat(surfIni.SURFACE_1?.FRICTION || '0.99'),
@@ -919,7 +978,27 @@ function addKn5Meshes(kn5) {
 
     const diffuseTex = mat.texSlots.txDiffuse || '';
     const baseMatName = mat.name.replace(/\.\d+$/, '');
-    const batchKey = `${baseMatName}__${diffuseTex}`;
+
+    const isRoadSurfaceMesh =
+      mesh.name.includes('1ROAD0_SUB0') ||
+      mesh.name.includes('1TARMAC') ||
+      mesh.name.includes('1PIT');
+
+    const isKerbOrLineMesh =
+      mesh.name.includes('1KERB') ||
+      mesh.name.includes('1ROAD0_SUB1') ||
+      mesh.name.includes('1ROAD0_SUB2') ||
+      mesh.name.includes('1ROAD0_SUB3');
+
+    const isTerrainMesh =
+      mesh.name.includes('GOOGLE_SAT') ||
+      mesh.name.includes('1GRASS') ||
+      mesh.name.includes('1SAND') ||
+      mesh.name.includes('1OFFTRACK');
+
+    const isGroundSurfaceMesh = isRoadSurfaceMesh || isKerbOrLineMesh || isTerrainMesh;
+    // Separate ground/surface meshes from building meshes that happen to share a material (e.g. Floor.008 vs 1KERB0/1OFFTRACK0 using "Rwanda blue")
+    const batchKey = `${isGroundSurfaceMesh ? 'SURF' : 'OBJ'}__${baseMatName}__${diffuseTex}`;
 
     if (diffuseTex) {
       const texBuf = kn5.textures.get(diffuseTex) || baseKn5.textures.get(diffuseTex);
@@ -935,23 +1014,6 @@ function addKn5Meshes(kn5) {
         /tree|fence|grass2|trans|symbol|welcome|bush|verde/i.test(mat.name) ||
         /tree|fence|grass2|trans|bush|verde/i.test(diffuseTex);
 
-      const isRoadSurface =
-        mesh.name.includes('1ROAD0_SUB0') ||
-        mesh.name.includes('1TARMAC') ||
-        mesh.name.includes('1PIT');
-
-      const isKerbOrLine =
-        mesh.name.includes('1KERB') ||
-        mesh.name.includes('1ROAD0_SUB1') ||
-        mesh.name.includes('1ROAD0_SUB2') ||
-        mesh.name.includes('1ROAD0_SUB3');
-
-      const isTerrain =
-        mesh.name.includes('GOOGLE_SAT') ||
-        mesh.name.includes('1GRASS') ||
-        mesh.name.includes('1SAND') ||
-        mesh.name.includes('1OFFTRACK');
-
       batch = {
         key: batchKey,
         materialName: baseMatName,
@@ -960,12 +1022,13 @@ function addKn5Meshes(kn5) {
         alphaBlend: Boolean(mat.alphaBlend),
         alphaTest: Boolean(mat.alphaTested || isFoliageOrFence),
         isFoliage: Boolean(mat.shader === 'ksTree' || /tree|grass2|bush|verde/i.test(diffuseTex)),
-        isRoadSurface: Boolean(isRoadSurface || isKerbOrLine),
-        isCoreAsphalt: Boolean(isRoadSurface),
-        isKerbOrLine: Boolean(isKerbOrLine),
-        isTerrain,
-        castShadow: Boolean(!isRoadSurface && !isKerbOrLine && !isTerrain && mesh.castShadows),
-        receiveShadow: Boolean(isRoadSurface || isKerbOrLine || isTerrain),
+        isRoadSurface: Boolean(isRoadSurfaceMesh || isKerbOrLineMesh),
+        isCoreAsphalt: Boolean(isRoadSurfaceMesh),
+        isKerbOrLine: Boolean(isKerbOrLineMesh),
+        isTerrain: Boolean(isTerrainMesh),
+        isGroundSurface: Boolean(isGroundSurfaceMesh),
+        castShadow: Boolean(!isGroundSurfaceMesh && mesh.castShadows),
+        receiveShadow: Boolean(isGroundSurfaceMesh),
         posMap: new Map(),
         positions: [],
         normals: [],
@@ -983,23 +1046,22 @@ function addKn5Meshes(kn5) {
         diffuseTex + ' ' + mat.name
       );
 
-    let posScale = 1.6;
-    let uvScale = isSolidColor ? 0.0 : 3.0;
-    if (batch.isCoreAsphalt) {
-      posScale = 25.0;
-      uvScale = 150.0;
+    // Crucial: NEVER quantize/snap vertices on ANY ground surface (road, tarmac, pit, kerb, offtrack, grass, sand)!
+    // Using posScale = 1000.0 (1mm lossless welding) preserves 100% of triangles and keeps all boundary seams watertight!
+    let posScale = 0.85;
+    let uvScale = isSolidColor ? 0.0 : 1.8;
+    if (batch.isGroundSurface) {
+      posScale = 1000.0;
+      uvScale = isSolidColor ? 0.0 : 500.0;
     } else if (/drs|sm1|ot1|100m|150m|50m|rolex|start_lights/i.test(mesh.name + ' ' + mat.name)) {
       posScale = 30.0;
       uvScale = 80.0;
-    } else if (batch.isKerbOrLine) {
-      posScale = 1.5;
-      uvScale = isSolidColor ? 0.0 : 1.5;
     } else if (/fences2/i.test(batch.key)) {
-      posScale = 0.40;
-      uvScale = isSolidColor ? 0.0 : 0.45;
+      posScale = 0.25;
+      uvScale = isSolidColor ? 0.0 : 0.30;
     } else if (/metal_d|guardrail|tent|grandstand|trans|bush|verde|hospitality|jumbotron|radiomast/i.test(batch.key)) {
-      posScale = 0.55;
-      uvScale = isSolidColor ? 0.0 : 0.8;
+      posScale = 0.35;
+      uvScale = isSolidColor ? 0.0 : 0.50;
     }
 
     for (let v = 0; v < vCount; v++) {
@@ -1036,7 +1098,6 @@ function addKn5Meshes(kn5) {
       }
       localToBatchIdx[v] = bIdx;
     }
-
 
     for (let t = 0; t < iCount; t += 3) {
       const off = iByteStart + t * 2;
