@@ -22,8 +22,6 @@ next-env.d.ts
 Thumbs.db
 .claude/
 
-# Assets converted locally from the Sim Dream VF26 AC EVO mod (scripts/vf26/) — not ours to redistribute
-/public/vf26/
-
 # Python bytecode from scripts/vf26
 __pycache__/
+

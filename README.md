@@ -24,11 +24,11 @@ A high-frequency, browser-based **2026 Formula 1 Grand Prix Simulator** set at t
 - **Gamepad Steering Assist**: Controller steering modelled on Assetto Corsa's *Advanced Gamepad Assist* (Custom Shaders Patch). Full stick steers up to the front tyres' peak slip angle at any speed, the wheel self-aligns toward the rear axle's direction of travel to catch slides, and a yaw-rate guard stops held countersteer from turning into a tank-slapper. Can be switched off in the settings panel.
 - **Racing-Line AI**: Follows the circuit's racing line with a target-speed profile computed from the car's grip, downforce, brakes and power, and laps the circuit in `~1:38–1:39`.
 
-### 3. VF26 3D Model, Driver & Sounds (local only)
-- With the mod's assets converted into `public/vf26/` (see [`scripts/vf26/README.md`](scripts/vf26/README.md)), the procedural car is replaced by the VF26 model in its Haas livery. The wheels and uprights steer and spin, the brake discs glow, the shift lights follow rpm, X-Mode opens the wings using the mod's own DRS poses, and the tyre sidewall changes with the compound.
-- The AC EVO driver (suit, gloves, shoes and helmet in the mod's livery) sits in the cockpit, and their hands follow the steering wheel through the mod's `driver_steer` animation. The helmet is hidden in the cockpit camera, as in AC EVO. The cockpit, T-cam and nose cameras use the AC EVO camera positions.
-- Engine, turbo and transmission sounds are rendered offline from the mod's FMOD bank with the game's own FMOD runtime, then crossfaded by rpm, throttle, boost and speed (`src/lib/sim/vf26-audio.ts`). Interior and exterior banks switch with the camera.
-- `public/vf26/` is gitignored and never deployed: the model, textures and sounds belong to the mod author and Kunos. Without it, the procedural car and the built-in engine samples are used.
+### 3. Custom Metallic Blue 2026 F1 3D Model, Driver & Sounds
+- Renders the 2026 F1 car (`public/vf26/model/vf26.glb`) in a custom **Metallic Blue + Exposed Carbon Fiber** livery with scrubbed sponsor branding and re-baked geometry. The wheels and uprights steer and spin, the brake discs glow, the shift lights follow rpm, X-Mode opens the wings using DRS poses, and the tyre sidewall changes with the compound.
+- The 3D driver (suit, gloves, shoes and helmet in matching Metallic Blue / Navy) sits in the cockpit, and their hands follow the steering wheel through the `driver_steer` animation. The helmet is hidden in the cockpit camera, and the cockpit, T-cam and nose cameras use the onboard camera anchors.
+- Engine, turbo and transmission sounds are crossfaded by rpm, throttle, boost and speed (`src/lib/sim/vf26-audio.ts`), switching between interior and exterior banks with the camera.
+
 
 ### 4. Serverless WebRTC Peer-to-Peer Multiplayer
 - **6-Character Room Code Mode**: Host or join a room across the internet using `RTCPeerConnection` + unordered/unreliable `RTCDataChannel` (`ordered: false, maxRetransmits: 0`) over Google Public STUN (`stun:stun.l.google.com:19302`) and the public PeerJS signaling broker.

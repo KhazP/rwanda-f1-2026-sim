@@ -14,7 +14,8 @@ No proprietary or paid mod assets are redistributed in raw form.
 * **Usage**:
   * Vehicle dimensions, spring rates, roll centres, aerodynamic coefficients, engine torque curves, and tyre dimensions were transcribed into [`src/lib/sim/vf26-data.ts`](src/lib/sim/vf26-data.ts).
   * In-code attribution tags identify every parameter's source (`[mod]` for raw values, `[setup]` for default garage setup, `[derived]` for calculated values, `[assumed]` for open regulation estimates).
-  * **No raw 3D models or audio banks are hosted in this repository.** Converted assets live strictly in the developer's local environment under gitignored paths (`public/vf26/`), with an automatic procedural car and synthetic audio fallback when absent.
+  * **No raw AC EVO `.kspkg` / `.mesh` / `.texture` archives are hosted in this repository.** The web runtime uses a re-baked, brand-scrubbed Metallic Blue GLB (`public/vf26/model/vf26.glb`) and pre-rendered OGG audio loops (`public/vf26/audio/`).
+
 
 ---
 
