@@ -83,11 +83,13 @@ npm run build
 
 ## Deployment (GitHub Pages)
 
-This repository includes an automated GitHub Actions workflow (`.github/workflows/deploy.yml`) configured for **GitHub Pages**. Every push to `main` runs `npm run build` and deploys the static `./out` bundle directly to GitHub Pages with zero backend hosting costs.
+This repository includes an automated GitHub Actions workflow (`.github/workflows/deploy-pages.yml`) configured for **GitHub Pages**. Every push to `main` runs `npm run build` and deploys the static `./out` bundle directly to GitHub Pages with zero backend hosting costs.
 
 ---
 
 ## Credits & Licenses
 
-- **Track Layout & 3D Circuit Assets**: [**Rwanda International Circuit (F1 2026 Spec)**](https://www.overtake.gg/downloads/rwanda-international-circuit-f1-2026-spec-fictional.73856/) created by **Tyrone – NucleoSim**.
-- **Vehicle Dynamics & Simulation Reference**: [**OpenCar**](https://github.com/theopencarproject/opencar) by **The OpenCar Project** (MIT License).
+- **Vehicle Dynamics & Tire/Aero Simulation Reference**: [**Speed Dreams / TORCS (`simuv4`)**](https://sourceforge.net/projects/speed-dreams/) — GPL-2.0+ License.
+- **Track Occupancy, Reference Lap & MPC Observation Architecture**: [**`assetto_corsa_gym`**](https://github.com/autonomous-racing-lab/assetto_corsa_gym) — MIT License.
+- **Track Layout & 3D Circuit Assets**: **Rwanda International Circuit (F1 2026 Variant)** by **Romeo Gagliotti (AlphaRomeo127)** (`ui_track.json`).
+

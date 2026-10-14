@@ -335,8 +335,8 @@ export function simWheelUpdateForce(
   }
 
   // Pneumatic trail self-aligning torque from wheel.cpp line 748:
-  // wheel->torqueAlign = wheel->AlignTqFactor * wheel->Forcen * sy / (1.0f + sy * sy)
-  wheel.torqueAlignNm = (cfg.alignTqFactor * fn * sy) / (1.0 + sy * sy);
+  // Pneumatic trail length scales with |sy| / (1 + sy^2); sign must match fn so it opposes slip in both left and right turns.
+  wheel.torqueAlignNm = (cfg.alignTqFactor * fn * Math.abs(sy)) / (1.0 + sy * sy);
   wheel.spinTqNm = ft * cfg.radius;
 
   wheel.ftN = ft;
@@ -388,7 +388,7 @@ export function simWheelUpdateRotation(
     const optSlipSpeed = vxMs + Math.max(1.6, vxMs) * (wheel.slipMax * 1.08);
     if (rimSpeed > optSlipSpeed) {
       const overSpeed = rimSpeed - optSlipSpeed;
-      const trim = Math.max(0.0, 1.0 - overSpeed * 0.45);
+      const trim = Math.max(-0.35, 1.0 - overSpeed * 1.4);
       effectiveDriveTq =
         wheel.spinTqNm + (driveInTqNm - wheel.spinTqNm) * trim;
     }

@@ -219,45 +219,56 @@ export function evaluateDynamicBrakingUrgency(
   const deltaS = (markerS - carS + totalLen) % totalLen;
   const markerSample = track.getSampleAtDistance(markerS);
 
-  // Search up to 220m ahead of the car for the upcoming corner apex speed v_apex
-  if (deltaS <= 220) {
-    // Effective deceleration a_eff(v) accounting for tire friction (mu * g) and
-    // speed-dependent aerodynamic drag + downforce-assisted braking (~28-35 m/s^2)
-    const speedRatio = THREE.MathUtils.clamp(carSpeedMs / 90.0, 0, 1.2);
-    const aEff = 28.0 + 7.0 * speedRatio * speedRatio;
-    const tMargin = 0.12;
-
+  // Evaluate dynamic braking urgency for markers within 260m ahead of the car
+  if (deltaS <= 260) {
+    const tMargin = 0.04;
     let maxUrgency = 0;
-    for (let lookDist = 0; lookDist <= 220; lookDist += 12) {
-      const checkS = (carS + lookDist) % totalLen;
+
+    // Look ahead from markerS up to 160m to see if markerS lies inside the physical braking zone
+    // required to decelerate from carSpeedMs down to the instantaneous cornering grip speed vGrip at checkS
+    for (let distFromMarker = 0; distFromMarker <= 160; distFromMarker += 6) {
+      const checkS = (markerS + distFromMarker) % totalLen;
       const sp = track.getSampleAtDistance(checkS);
-      const vApex = sp.optimalSpeedKmh / 3.6;
-      if (carSpeedMs > vApex) {
-        const dBrake =
-          (carSpeedMs * carSpeedMs - vApex * vApex) / (2.0 * aEff) +
-          carSpeedMs * tMargin;
-        if (deltaS <= lookDist + 8) {
-          if (lookDist <= dBrake) {
+      const absK = Math.abs(sp.curvature);
+
+      if (absK > 0.0055) {
+        const bankBonus = Math.max(0, Math.tan(Math.abs(sp.bankingRad))) * 9.81;
+        const hairpinFactor = THREE.MathUtils.clamp((absK - 0.020) / 0.012, 0, 1);
+        const a0 = 17.8 - 2.4 * hairpinFactor + bankBonus * 1.25;
+        const effK = Math.max(0.0022, absK - 0.0038 * (1.0 - 0.55 * hairpinFactor));
+        const vGrip = THREE.MathUtils.clamp(Math.sqrt(a0 / effK), 18.5, 98.5);
+
+        // Only trigger if checkS is stricter than the marker's local optimal speed (i.e. approaching/entering corner, not exiting)
+        const isCornerApproach =
+          distFromMarker === 0
+            ? markerSample.brakingZone > 0.1
+            : vGrip < markerOptimalSpeedMs - 0.5;
+
+        if (isCornerApproach && carSpeedMs > vGrip + 1.0) {
+          const vRmsSq = 0.5 * (carSpeedMs * carSpeedMs + vGrip * vGrip);
+          const aEff = 26.5 + 8.5 * Math.min(1.2, vRmsSq / (88.0 * 88.0));
+          const dBrake =
+            (carSpeedMs * carSpeedMs - vGrip * vGrip) / (2.0 * aEff) +
+            carSpeedMs * tMargin;
+
+          if (distFromMarker <= dBrake) {
             maxUrgency = Math.max(maxUrgency, 1.0);
-          } else if (lookDist <= dBrake + 35.0) {
-            const blend = 1.0 - (lookDist - dBrake) / 35.0;
-            maxUrgency = Math.max(maxUrgency, 0.4 + 0.5 * blend);
+            break;
+          } else if (distFromMarker <= dBrake + 35.0) {
+            const blend = 1.0 - (distFromMarker - dBrake) / 35.0;
+            maxUrgency = Math.max(maxUrgency, 0.35 + 0.6 * blend);
           }
         }
       }
     }
 
-    if (carSpeedMs > markerOptimalSpeedMs) {
-      const dBrakeLocal =
-        (carSpeedMs * carSpeedMs - markerOptimalSpeedMs * markerOptimalSpeedMs) /
-          (2.0 * aEff) +
-        carSpeedMs * tMargin;
-      if (deltaS <= dBrakeLocal) {
-        maxUrgency = Math.max(maxUrgency, 1.0);
-      } else if (deltaS <= dBrakeLocal + 35.0) {
-        const blend = 1.0 - (deltaS - dBrakeLocal) / 35.0;
-        maxUrgency = Math.max(maxUrgency, 0.4 + 0.5 * blend);
-      }
+    // Also keep markers inside an active corner braking zone red while the car is threshold-braking along the optimal deceleration curve
+    if (
+      markerSample.brakingZone >= 0.5 &&
+      carSpeedMs >= markerOptimalSpeedMs - 2.5 &&
+      deltaS <= 125
+    ) {
+      maxUrgency = Math.max(maxUrgency, 1.0);
     }
 
     return THREE.MathUtils.clamp(maxUrgency, 0, 1);

@@ -112,11 +112,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 1,
     elevationM: 35,
     bankingDeg: 2,
-    apexSpeedKmh: 162,
-    gear: 4,
+    apexSpeedKmh: 118,
+    gear: 3,
     description:
       "Heavy braking from 340+ km/h at the end of the main straight into a tightening right-hander.",
-    sApprox: 610,
+    sApprox: 498,
   },
   {
     number: 2,
@@ -125,11 +125,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 1,
     elevationM: 32,
     bankingDeg: 3,
-    apexSpeedKmh: 188,
-    gear: 4,
+    apexSpeedKmh: 129,
+    gear: 3,
     description:
       "Quick left-hand direction change that sets up side-by-side racing lines into Turn 3.",
-    sApprox: 820,
+    sApprox: 567,
   },
   {
     number: 3,
@@ -142,7 +142,7 @@ export const TURN_METADATA: TurnMetadata[] = [
     gear: 6,
     description:
       "Sweeping 6° banked right-hander launching cars downhill toward The Arena at full throttle.",
-    sApprox: 1050,
+    sApprox: 760,
   },
   {
     number: 4,
@@ -151,11 +151,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 1,
     elevationM: 4,
     bankingDeg: 6,
-    apexSpeedKmh: 175,
-    gear: 4,
+    apexSpeedKmh: 98,
+    gear: 3,
     description:
       "At the lowest point of the track, a 6° banked right-hander after a fast downhill plunge.",
-    sApprox: 1640,
+    sApprox: 1632,
   },
   {
     number: 5,
@@ -164,11 +164,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 1,
     elevationM: 8,
     bankingDeg: 2,
-    apexSpeedKmh: 122,
+    apexSpeedKmh: 108,
     gear: 3,
     description:
       "Tight left-hand pivot inside the stadium section encouraging late-braking switchbacks.",
-    sApprox: 1890,
+    sApprox: 1686,
   },
   {
     number: 6,
@@ -177,11 +177,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 1,
     elevationM: 12,
     bankingDeg: 6,
-    apexSpeedKmh: 148,
-    gear: 3,
+    apexSpeedKmh: 182,
+    gear: 4,
     description:
       "Banked 6° right-hand exit critical for traction up the steep climb toward Sector 2.",
-    sApprox: 2050,
+    sApprox: 1860,
   },
   {
     number: 7,
@@ -190,11 +190,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 2,
     elevationM: 32,
     bankingDeg: 2,
-    apexSpeedKmh: 205,
-    gear: 5,
+    apexSpeedKmh: 120,
+    gear: 3,
     description:
       "Blind uphill arrival into a fast right-hander opening the technical infield complex.",
-    sApprox: 2480,
+    sApprox: 2614,
   },
   {
     number: 8,
@@ -203,11 +203,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 2,
     elevationM: 36,
     bankingDeg: 2,
-    apexSpeedKmh: 195,
-    gear: 5,
+    apexSpeedKmh: 137,
+    gear: 4,
     description:
       "Flowing left-hander wrapping around the central hill where car placement is paramount.",
-    sApprox: 2820,
+    sApprox: 2809,
   },
   {
     number: 9,
@@ -216,11 +216,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 2,
     elevationM: 34,
     bankingDeg: 1,
-    apexSpeedKmh: 215,
-    gear: 5,
+    apexSpeedKmh: 148,
+    gear: 4,
     description:
       "High-commitment right-hand kink linking the infield switchbacks toward the paddock loop.",
-    sApprox: 3040,
+    sApprox: 2875,
   },
   {
     number: 10,
@@ -229,11 +229,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 2,
     elevationM: 30,
     bankingDeg: 3,
-    apexSpeedKmh: 145,
+    apexSpeedKmh: 100,
     gear: 3,
     description:
       "Long double-apex right-hander curling toward the downhill valley.",
-    sApprox: 3250,
+    sApprox: 2925,
   },
   {
     number: 11,
@@ -242,11 +242,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 2,
     elevationM: 22,
     bankingDeg: 2,
-    apexSpeedKmh: 165,
-    gear: 4,
+    apexSpeedKmh: 210,
+    gear: 5,
     description:
       "Off-camber left-hand transition beginning the descent out of the infield.",
-    sApprox: 3460,
+    sApprox: 3210,
   },
   {
     number: 12,
@@ -255,11 +255,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 2,
     elevationM: 14,
     bankingDeg: 2,
-    apexSpeedKmh: 158,
+    apexSpeedKmh: 130,
     gear: 4,
     description:
       "Right-hand exit corner dropping into the fast valley toward Lake Bugesera.",
-    sApprox: 3660,
+    sApprox: 3423,
   },
   {
     number: 13,
@@ -272,7 +272,7 @@ export const TURN_METADATA: TurnMetadata[] = [
     gear: 7,
     description:
       "High-G compression through a fast sweeping left-hander.",
-    sApprox: 3920,
+    sApprox: 3760,
   },
   {
     number: 14,
@@ -285,7 +285,7 @@ export const TURN_METADATA: TurnMetadata[] = [
     gear: 6,
     description:
       "Curved uphill approach that forces drivers to trail-brake while turning into Turn 15.",
-    sApprox: 4100,
+    sApprox: 4080,
   },
   {
     number: 15,
@@ -294,11 +294,11 @@ export const TURN_METADATA: TurnMetadata[] = [
     sector: 3,
     elevationM: 35,
     bankingDeg: 3,
-    apexSpeedKmh: 98,
+    apexSpeedKmh: 68,
     gear: 2,
     description:
       "The signature corner: a tight lakeside hairpin after a high-speed braking zone.",
-    sApprox: 4380,
+    sApprox: 4280,
   },
   {
     number: 16,
@@ -311,7 +311,7 @@ export const TURN_METADATA: TurnMetadata[] = [
     gear: 7,
     description:
       "Blind 295 km/h right-hand kink over the highest point of the circuit (+50m elevation).",
-    sApprox: 4780,
+    sApprox: 4720,
   },
   {
     number: 17,
@@ -324,7 +324,7 @@ export const TURN_METADATA: TurnMetadata[] = [
     gear: 6,
     description:
       "Fast downhill sweeper framed by iconic cyan, yellow, and green Rwandan runoff art.",
-    sApprox: 4990,
+    sApprox: 4980,
   },
   {
     number: 18,
@@ -355,6 +355,8 @@ function isInDrsZone(t: number): boolean {
   return false;
 }
 
+const LEFT_HAND_TURNS = new Set([2, 5, 8, 11, 13, 15, 17]);
+
 function getTurnInfoAtS(
   s: number,
   totalLen: number
@@ -378,7 +380,7 @@ function getTurnInfoAtS(
     }
   }
 
-  if (closestTurn && minDiff <= 95) {
+  if (closestTurn && minDiff <= 85) {
     const styles: RunoffStyle[] = [
       "qatar_maroon",
       "visit_rwanda_blue",
@@ -386,13 +388,14 @@ function getTurnInfoAtS(
       "bugesera_cyan",
       "rwandair_blue_yellow",
     ];
-    const envelope = Math.cos((minDiff / 95) * Math.PI * 0.5);
+    const envelope = Math.cos((minDiff / 85) * Math.PI * 0.5);
+    const sign = LEFT_HAND_TURNS.has(closestTurn.number) ? -1 : 1;
     return {
       sector,
       turnNumber: closestTurn.number,
       turnName: closestTurn.name,
       runoffStyle: styles[(closestTurn.number - 1) % styles.length],
-      minBankRad: THREE.MathUtils.degToRad(closestTurn.bankingDeg) * envelope,
+      minBankRad: sign * THREE.MathUtils.degToRad(closestTurn.bankingDeg) * envelope,
     };
   }
 
@@ -461,6 +464,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
   const widths: number[] = [];
   const bankings: number[] = [];
   const grips: number[] = [];
+  const aiSpeedsKmh: number[] = [];
 
   let rawIdx = 0;
   for (let i = 0; i < NUM_SAMPLES; i++) {
@@ -496,8 +500,15 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
 
     const turnInfo = getTurnInfoAtS(targetS, totalLength);
     const meshBank = THREE.MathUtils.lerp(r0.b, r1.b, alpha);
-    bankings.push(Math.max(meshBank, turnInfo.minBankRad));
+    const combinedBank =
+      turnInfo.minBankRad >= 0
+        ? Math.max(meshBank, turnInfo.minBankRad)
+        : Math.min(meshBank, turnInfo.minBankRad);
+    bankings.push(combinedBank);
     grips.push(THREE.MathUtils.lerp(r0.g ?? 1.0, r1.g ?? 1.0, alpha));
+    const v0 = (r0 as { v?: number }).v ?? 315;
+    const v1 = (r1 as { v?: number }).v ?? 315;
+    aiSpeedsKmh.push(THREE.MathUtils.lerp(v0, v1, alpha));
   }
 
   // Ensure the starting grid straight (s = 0..195m, already collinear within 1.2 cm in the KN5 road mesh)
@@ -563,7 +574,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     normals.push(normal);
     binormals.push(binormal);
 
-    // Measure horizontal curvature along the optimal racing line over a ±4 sample (±17.7m) chord
+    // Measure horizontal curvature blending the optimal racing line and centerline over a ±4 sample (±17.7m) chord
     const rPrev = racingPositions[(i - 4 + NUM_SAMPLES) % NUM_SAMPLES];
     const rCurr = racingPositions[i];
     const rNext = racingPositions[(i + 4) % NUM_SAMPLES];
@@ -577,12 +588,31 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     ).normalize();
     const cross = vIn.x * vOut.y - vIn.y * vOut.x;
     const dot = THREE.MathUtils.clamp(vIn.dot(vOut), -1, 1);
-    const dTheta = Math.atan2(cross, dot);
-    const chordLen = Math.max(
+    const dThetaRace = Math.atan2(cross, dot);
+    const chordLenRace = Math.max(
       1.0,
       Math.hypot(rNext.x - rPrev.x, rNext.z - rPrev.z)
     );
-    curvatures.push(dTheta / (0.5 * chordLen));
+    const kRace = dThetaRace / (0.5 * chordLenRace);
+
+    const cPrev = positions[(i - 4 + NUM_SAMPLES) % NUM_SAMPLES];
+    const cNext = positions[(i + 4) % NUM_SAMPLES];
+    const cIn = new THREE.Vector2(curr.x - cPrev.x, curr.z - cPrev.z).normalize();
+    const cOut = new THREE.Vector2(cNext.x - curr.x, cNext.z - curr.z).normalize();
+    const cCross = cIn.x * cOut.y - cIn.y * cOut.x;
+    const cDot = THREE.MathUtils.clamp(cIn.dot(cOut), -1, 1);
+    const dThetaCenter = Math.atan2(cCross, cDot);
+    const chordLenCenter = Math.max(
+      1.0,
+      Math.hypot(cNext.x - cPrev.x, cNext.z - cPrev.z)
+    );
+    const kCenter = dThetaCenter / (0.5 * chordLenCenter);
+
+    const kBlend =
+      Math.abs(kCenter) > Math.abs(kRace)
+        ? 0.55 * kCenter + 0.45 * kRace
+        : 0.35 * kCenter + 0.65 * kRace;
+    curvatures.push(kBlend);
 
     const prevSlope =
       (curr.y - prev2.y) / Math.max(0.5, prev2.distanceTo(curr));
@@ -601,21 +631,24 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
   }
 
   // Compute physically grounded optimal speed profile (km/h) along the racing line
+  // using speed-dependent mechanical + aerodynamic lateral grip
   const rawSpeedsMs: number[] = [];
   for (let i = 0; i < NUM_SAMPLES; i++) {
     const absK = Math.abs(curvatures[i]);
     const bankBonus = Math.max(0, Math.tan(Math.abs(bankings[i]))) * 9.81;
-    const maxLatAccel = 36.5 + bankBonus * 1.4;
-    if (absK < 0.0012) {
+    if (absK < 0.0015) {
       rawSpeedsMs.push(98.5);
     } else {
-      const vMax = Math.sqrt(maxLatAccel / absK);
-      rawSpeedsMs.push(THREE.MathUtils.clamp(vMax, 25.0, 98.5));
+      const hairpinFactor = THREE.MathUtils.clamp((absK - 0.020) / 0.012, 0, 1);
+      const a0 = 17.8 - 2.4 * hairpinFactor + bankBonus * 1.25;
+      const effK = Math.max(0.0022, absK - 0.0038 * (1.0 - 0.55 * hairpinFactor));
+      const vCurv = Math.sqrt(a0 / effK);
+      rawSpeedsMs.push(THREE.MathUtils.clamp(vCurv, 18.5, 98.5));
     }
   }
 
   const optSpeedsMs = [...rawSpeedsMs];
-  for (let pass = 0; pass < 2; pass++) {
+  for (let pass = 0; pass < 3; pass++) {
     for (let i = 0; i < NUM_SAMPLES; i++) {
       const next = (i + 1) % NUM_SAMPLES;
       const v = optSpeedsMs[i];
@@ -628,7 +661,7 @@ export function getRwandaTrackData(numSamples = 1200): BuiltTrackData {
     for (let i = NUM_SAMPLES - 1; i >= 0; i--) {
       const prev = (i - 1 + NUM_SAMPLES) % NUM_SAMPLES;
       const v = optSpeedsMs[i];
-      const maxBrakeDecel = 27.0 + 19.0 * Math.min(1.0, (v / 88.0) ** 2);
+      const maxBrakeDecel = 26.5 + 8.5 * Math.min(1.2, (v / 88.0) ** 2);
       optSpeedsMs[prev] = Math.min(
         optSpeedsMs[prev],
         Math.sqrt(v * v + 2 * maxBrakeDecel * ds)

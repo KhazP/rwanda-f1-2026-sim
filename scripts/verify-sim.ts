@@ -249,7 +249,8 @@ async function runVerification() {
   const simAi = new F1Physics2026(track);
   simAi.resetToStartGrid(true);
   simAi.aiAutopilot = true;
-  for (let i = 0; i < 300; i++) {
+  let aiOffTrackFrames = 0;
+  for (let i = 0; i < 600; i++) {
     simAi.step(1 / 60, {
       throttle: 0,
       brake: 0,
@@ -260,10 +261,11 @@ async function runVerification() {
       shiftUp: false,
       shiftDown: false,
     });
+    if (simAi.telemetry.offTrack) aiOffTrackFrames++;
   }
   assert(
-    !simAi.telemetry.offTrack && simAi.telemetry.speedKmh > 120,
-    `MPC AI keeps car within track boundaries at racing speed (speed=${simAi.telemetry.speedKmh.toFixed(1)} km/h, latOffset=${simAi.lateralOffsetM.toFixed(2)}m)`
+    aiOffTrackFrames === 0 && !simAi.telemetry.offTrack && simAi.telemetry.speedKmh > 95 && simAi.sMeters > 550,
+    `MPC AI keeps car within track boundaries through Turn 1-2 for 600 frames (offTrackFrames=${aiOffTrackFrames}, s=${simAi.sMeters.toFixed(1)}m, speed=${simAi.telemetry.speedKmh.toFixed(1)} km/h, latOffset=${simAi.lateralOffsetM.toFixed(2)}m)`
   );
 
   // 6. Grandstand & Structure Track Clearance Verification (User bug: "there are some grandstands right on the track")
@@ -664,20 +666,55 @@ async function runVerification() {
     `320 km/h -> 100 km/h threshold braking distance is realistic (${brakingDistanceM.toFixed(1)}m within [95m, 130m])`
   );
 
-  // 9.8 Assetto Corsa KN5 Track Geometry & 12 Trackside TV Cameras Verification
+  // 9.8 Assetto Corsa KN5 Track Geometry (< 15 MB per file, < 25 MB total), Dynamic Braking Zone & 12 Trackside TV Cameras Verification
   const { getTracksideTvCameras, getActiveTvCamera } = await import('../src/lib/track-data');
+  const { evaluateDynamicBrakingUrgency } = await import('../src/lib/sim/track-occupancy');
   const tvCams = getTracksideTvCameras();
   const sampleTvCam = getActiveTvCamera(0.25);
-  const manifestPath = path.resolve(process.cwd(), 'public/tracks/rwanda/manifest.json');
-  const meshBinPath = path.resolve(process.cwd(), 'public/tracks/rwanda/track_meshes.bin');
+  const trackDir = path.resolve(process.cwd(), 'public/tracks/rwanda');
+  const manifestPath = path.resolve(trackDir, 'manifest.json');
+  const meshBinPath = path.resolve(trackDir, 'track_meshes.bin');
+  const meshBinBytes = fs.statSync(meshBinPath).size;
+
+  // Compute total size and max single-file size in public/tracks/rwanda
+  const getFilesRecursive = (dir: string): string[] => {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const out: string[] = [];
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) out.push(...getFilesRecursive(full));
+      else out.push(full);
+    }
+    return out;
+  };
+  const allTrackFiles = getFilesRecursive(trackDir);
+  let totalTrackBytes = 0;
+  let maxSingleFileBytes = 0;
+  for (const f of allTrackFiles) {
+    const sz = fs.statSync(f).size;
+    totalTrackBytes += sz;
+    if (sz > maxSingleFileBytes) maxSingleFileBytes = sz;
+  }
+
   assert(
     tvCams.length === 12 &&
       Boolean(sampleTvCam && sampleTvCam.position.length === 3) &&
       fs.existsSync(manifestPath) &&
       fs.existsSync(meshBinPath) &&
-      fs.statSync(meshBinPath).size > 1_000_000 &&
-      fs.statSync(meshBinPath).size < 25 * 1024 * 1024,
-    `Assetto Corsa KN5 binary track mesh (${(fs.statSync(meshBinPath).size / 1048576).toFixed(2)} MB < 25 MB) and ${tvCams.length} official TV cameras verified (active cam @ 0.25 = ${sampleTvCam?.name})`
+      meshBinBytes > 1_000_000 &&
+      maxSingleFileBytes < 15 * 1000 * 1000 &&
+      totalTrackBytes < 25 * 1024 * 1024,
+    `Assetto Corsa KN5 binary track mesh (${(meshBinBytes / 1048576).toFixed(2)} MiB < 15 MB, total ${(totalTrackBytes / 1048576).toFixed(2)} MiB < 25 MB) and ${tvCams.length} official TV cameras verified (active cam @ 0.25 = ${sampleTvCam?.name})`
+  );
+
+  // 9.9 Dynamic Braking Zone Urgency Ahead of Real Turn 1 (s ≈ 490m)
+  const urgGreen = evaluateDynamicBrakingUrgency(track, 280, 315 / 3.6, 290, track.getSampleAtDistance(290).optimalSpeedKmh / 3.6);
+  const urgYellow = evaluateDynamicBrakingUrgency(track, 280, 315 / 3.6, 320, track.getSampleAtDistance(320).optimalSpeedKmh / 3.6);
+  const urgRed = evaluateDynamicBrakingUrgency(track, 280, 315 / 3.6, 360, track.getSampleAtDistance(360).optimalSpeedKmh / 3.6);
+  const urgExit = evaluateDynamicBrakingUrgency(track, 280, 315 / 3.6, 510, track.getSampleAtDistance(510).optimalSpeedKmh / 3.6);
+  assert(
+    urgGreen === 0 && urgYellow > 0.2 && urgYellow < 0.9 && urgRed === 1.0 && urgExit === 0,
+    `Dynamic braking urgency ahead of Turn 1 transitions cleanly Green (${urgGreen.toFixed(2)} @ 290m) -> Yellow (${urgYellow.toFixed(2)} @ 320m) -> Red (${urgRed.toFixed(2)} @ 360m) -> Green (${urgExit.toFixed(2)} @ 510m exit)`
   );
 
   console.log('\nALL 9 VERIFICATION SUITES PASSED SUCCESSFULLY!');

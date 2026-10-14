@@ -139,12 +139,32 @@ export const F1TelemetryHud: React.FC<F1TelemetryHudProps> = ({
   const [sdpInput, setSdpInput] = useState("");
   const [generatedToken, setGeneratedToken] = useState("");
   const [copiedToken, setCopiedToken] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
   const [sdpBusy, setSdpBusy] = useState(false);
 
   const traceCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const traceHistoryRef = useRef<
     Array<{ thr: number; brk: number; clt: number; ffb: number }>
   >([]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const roomParam = params.get("room");
+    if (roomParam && roomParam.trim().length >= 3) {
+      const normalized = roomParam
+        .trim()
+        .replace(/^RWA-/i, "")
+        .toUpperCase()
+        .slice(0, 6);
+      if (normalized.length >= 3) {
+        setRoomCodeInput(normalized);
+        setP2pOpen(true);
+        onJoinP2PRoom?.(normalized);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const hist = traceHistoryRef.current;
@@ -896,6 +916,25 @@ export const F1TelemetryHud: React.FC<F1TelemetryHudProps> = ({
                     className="rounded bg-[#00D2BE] px-2.5 py-1.5 font-f1-italic text-[10px] font-black uppercase tracking-wider text-[#0B0B10] hover:opacity-90 cursor-pointer shrink-0"
                   >
                     Join Room
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!(p2pStatus?.roomCode || roomCodeInput.trim())}
+                    onClick={() => {
+                      const activeCode = (
+                        p2pStatus?.roomCode || roomCodeInput.trim()
+                      )
+                        .replace(/^RWA-/i, "")
+                        .toUpperCase();
+                      if (!activeCode || typeof window === "undefined") return;
+                      const url = `${window.location.origin}${window.location.pathname}?room=RWA-${activeCode}`;
+                      navigator.clipboard?.writeText(url);
+                      setCopiedLink(true);
+                      setTimeout(() => setCopiedLink(false), 2000);
+                    }}
+                    className="rounded border border-white/20 bg-white/10 px-2 py-1.5 font-f1-italic text-[10px] uppercase tracking-wider text-white hover:bg-white/20 disabled:opacity-40 cursor-pointer shrink-0"
+                  >
+                    {copiedLink ? "Link Copied!" : "Copy Invite"}
                   </button>
                 </div>
               </div>

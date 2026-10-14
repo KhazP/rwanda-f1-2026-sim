@@ -606,10 +606,11 @@ export class F1Physics2026 {
         this.rawSteerFiltered = 0;
       }
 
-      // Speed-sensitive steering ratio (prevents twitchy over-steering at 330+ km/h)
+      // Speed-sensitive steering ratio (full authority in slow/medium corners, progressive high-speed authority at 300+ km/h)
+      const excessSpeed = Math.max(0, Math.abs(this.vxMs) - 34.0);
       const speedSensitivity =
-        1.0 / (1.0 + Math.pow(Math.max(0, this.vxMs) / 68.0, 1.55));
-      const minHighSpeedAuthority = 0.24;
+        1.0 / (1.0 + Math.pow(excessSpeed / 58.0, 1.45));
+      const minHighSpeedAuthority = 0.34;
       const effectiveUiSteer =
         this.rawSteerFiltered * Math.max(minHighSpeedAuthority, speedSensitivity);
 
@@ -949,13 +950,18 @@ export class F1Physics2026 {
       sumFy -= clampedRv * this.vyMs;
     }
 
-    // Aerodynamic shark-fin / rear-wing sideslip weathervane restoring moment & yaw rate damping:
-    // In TORCS body frame (+y left, +z yaw counter-clockwise/left), a rightward slide (vy < 0)
-    // generates sideforce on the rear shark-fin and diffuser behind CG, creating a negative Mz
-    // that weathervanes the nose into the slide and prevents spin divergence on low-grip surfaces.
+    // 4-wheel Pacejka lateral tire forces & pneumatic trail govern yaw and lateral dynamics,
+    // supplemented by physical shark-fin / rear-wing aerodynamic weathervane stability (Cn_beta)
+    // and scaling up during extreme slides (>20 deg heading error) or off-track excursions.
+    const isOffTrack = Math.abs(this.lateralOffsetM) > sample.width * 0.5;
+    const slideIntensity = THREE.MathUtils.clamp(
+      (Math.abs(this.headingErrorRad) - 0.35) / 0.55 + (isOffTrack ? 0.35 : 0),
+      0,
+      1
+    );
     const aeroWeathervaneMz =
-      Math.max(8.0, Math.abs(this.vxMs)) * this.vyMs * 36.0 -
-      yawRateTorcs * (520.0 + Math.abs(this.vxMs) * 18.0);
+      slideIntensity * Math.max(8.0, Math.abs(this.vxMs)) * this.vyMs * 32.0 -
+      yawRateTorcs * (85.0 + slideIntensity * (450.0 + Math.abs(this.vxMs) * 16.0));
     sumMzTorcs += aeroWeathervaneMz;
 
     // Crucial Symmetry & Straight-Line Stability Guarantee:
@@ -983,16 +989,8 @@ export class F1Physics2026 {
     this.vxMs += (axCar + this.vyMs * yawRateTorcs) * dt;
     this.vyMs += (ayCar - this.vxMs * yawRateTorcs) * dt;
 
-    // Let the 4-wheel Pacejka lateral tire forces & pneumatic trail govern yaw and lateral damping
-    // during normal driving (0.35 / 0.45), scaling up smoothly only during extreme off-track slides
-    const isOffTrack = Math.abs(this.lateralOffsetM) > sample.width * 0.5;
-    const slideIntensity = THREE.MathUtils.clamp(
-      (Math.abs(this.headingErrorRad) - 0.25) / 0.55 + (isOffTrack ? 0.35 : 0),
-      0,
-      1
-    );
-    const latDamping = Math.exp(-(0.45 + 3.2 * slideIntensity) * dt);
-    const yawDamping = Math.exp(-(0.35 + 4.2 * slideIntensity) * dt);
+    const latDamping = Math.exp(-(0.20 + 3.2 * slideIntensity) * dt);
+    const yawDamping = Math.exp(-(0.15 + 4.2 * slideIntensity) * dt);
     this.vyMs *= latDamping;
     const nextYawRateTorcs = (yawRateTorcs + yawAccelTorcs * dt) * yawDamping;
     this.yawRateRadS = THREE.MathUtils.clamp(-nextYawRateTorcs, -4.5, 4.5);
@@ -1194,7 +1192,7 @@ export class F1Physics2026 {
       this.track,
       this.sMeters
     );
-    const racelineOffsetM = sample.racingLineOffset * sample.width * 0.42;
+    const racelineOffsetM = sample.racingLineOffset * sample.width * 0.30;
     const gapToRacingLineM = this.lateralOffsetM - racelineOffsetM;
 
     let wheelsOut = 0;

@@ -262,6 +262,63 @@ function decodeDdsToRgba(buf) {
 // ---------------------------------------------------------------------------
 // 3. Parse KN5 File Helper
 // ---------------------------------------------------------------------------
+function createIdentityMat4() {
+  return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+}
+
+function multiplyMat4(localMat, parentMat) {
+  const out = new Array(16).fill(0);
+  for (let r = 0; r < 4; r++) {
+    for (let c = 0; c < 4; c++) {
+      out[r * 4 + c] =
+        localMat[r * 4 + 0] * parentMat[0 * 4 + c] +
+        localMat[r * 4 + 1] * parentMat[1 * 4 + c] +
+        localMat[r * 4 + 2] * parentMat[2 * 4 + c] +
+        localMat[r * 4 + 3] * parentMat[3 * 4 + c];
+    }
+  }
+  return out;
+}
+
+function isIdentityMat4(m) {
+  return (
+    Math.abs(m[0] - 1) < 1e-5 &&
+    Math.abs(m[1]) < 1e-5 &&
+    Math.abs(m[2]) < 1e-5 &&
+    Math.abs(m[3]) < 1e-5 &&
+    Math.abs(m[4]) < 1e-5 &&
+    Math.abs(m[5] - 1) < 1e-5 &&
+    Math.abs(m[6]) < 1e-5 &&
+    Math.abs(m[7]) < 1e-5 &&
+    Math.abs(m[8]) < 1e-5 &&
+    Math.abs(m[9]) < 1e-5 &&
+    Math.abs(m[10] - 1) < 1e-5 &&
+    Math.abs(m[11]) < 1e-5 &&
+    Math.abs(m[12]) < 1e-5 &&
+    Math.abs(m[13]) < 1e-5 &&
+    Math.abs(m[14]) < 1e-5 &&
+    Math.abs(m[15] - 1) < 1e-5
+  );
+}
+
+function transformPointMat4(x, y, z, m) {
+  if (!m || m._isIdentity) return [x, y, z];
+  return [
+    x * m[0] + y * m[4] + z * m[8] + m[12],
+    x * m[1] + y * m[5] + z * m[9] + m[13],
+    x * m[2] + y * m[6] + z * m[10] + m[14],
+  ];
+}
+
+function transformNormalMat4(nx, ny, nz, m) {
+  if (!m || m._isIdentity) return [nx, ny, nz];
+  const rx = nx * m[0] + ny * m[4] + nz * m[8];
+  const ry = nx * m[1] + ny * m[5] + nz * m[9];
+  const rz = nx * m[2] + ny * m[6] + nz * m[10];
+  const len = Math.hypot(rx, ry, rz) || 1;
+  return [rx / len, ry / len, rz / len];
+}
+
 function parseKn5(filePath) {
   const buf = fs.readFileSync(filePath);
   const magic = buf.toString('ascii', 0, 6);
@@ -357,7 +414,10 @@ function parseKn5(filePath) {
   }
 
   const meshes = [];
-  function readNode(ancestorPath = '') {
+  const rootIdent = createIdentityMat4();
+  rootIdent._isIdentity = true;
+
+  function readNode(ancestorPath = '', parentMatrix = rootIdent) {
     const nodeClass = buf.readInt32LE(pos);
     pos += 4;
     const nameLen = buf.readInt32LE(pos);
@@ -370,9 +430,16 @@ function parseKn5(filePath) {
     pos += 1;
 
     const currentPath = ancestorPath ? `${ancestorPath}/${name}` : name;
+    let currentMatrix = parentMatrix;
 
     if (nodeClass === 1) {
+      const localMat = new Array(16);
+      for (let k = 0; k < 16; k++) {
+        localMat[k] = buf.readFloatLE(pos + k * 4);
+      }
       pos += 64; // 4x4 transform matrix
+      currentMatrix = multiplyMat4(localMat, parentMatrix);
+      currentMatrix._isIdentity = isIdentityMat4(currentMatrix);
     } else if (nodeClass === 2) {
       const castShadows = buf.readUInt8(pos);
       const isVisible = buf.readUInt8(pos + 1);
@@ -397,6 +464,7 @@ function parseKn5(filePath) {
         name,
         parentName: ancestorPath,
         ancestorPath: currentPath,
+        worldMatrix: currentMatrix,
         active,
         castShadows,
         isVisible,
@@ -423,7 +491,7 @@ function parseKn5(filePath) {
     }
 
     for (let c = 0; c < childrenCount; c++) {
-      readNode(currentPath);
+      readNode(currentPath, currentMatrix);
     }
   }
 
@@ -449,15 +517,18 @@ for (const mesh of baseKn5.meshes) {
 
   const prio = mesh.name === '1ROAD0_SUB0' ? 0 : isTarmac ? 1 : isRoad ? 2 : 3;
   const baseV = roadVerts.length;
-  const { buf, vByteStart, vCount, iByteStart, iCount } = mesh;
+  const { buf, vByteStart, vCount, iByteStart, iCount, worldMatrix } = mesh;
 
   for (let v = 0; v < vCount; v++) {
     const off = vByteStart + v * 44;
-    roadVerts.push([
-      buf.readFloatLE(off),
-      buf.readFloatLE(off + 4),
-      buf.readFloatLE(off + 8),
-    ]);
+    roadVerts.push(
+      transformPointMat4(
+        buf.readFloatLE(off),
+        buf.readFloatLE(off + 4),
+        buf.readFloatLE(off + 8),
+        worldMatrix
+      )
+    );
   }
   for (let t = 0; t < iCount; t += 3) {
     const off = iByteStart + t * 2;
@@ -636,9 +707,14 @@ for (let i = 0; i < numAiPoints; i++) {
   const dist = aiBuf.readFloatLE(pOff + 12);
 
   const eOff = extraBase + i * 72;
+  const speedMs = Math.max(8.0, aiBuf.readFloatLE(eOff + 0 * 4));
+  const gas = Math.max(0.0, Math.min(1.0, aiBuf.readFloatLE(eOff + 1 * 4)));
+  const brake = Math.max(0.0, Math.min(1.0, aiBuf.readFloatLE(eOff + 2 * 4)));
+  const radius = aiBuf.readFloatLE(eOff + 4 * 4);
   const sideLeft = Math.max(1.0, aiBuf.readFloatLE(eOff + 5 * 4));
   const sideRight = Math.max(1.0, aiBuf.readFloatLE(eOff + 6 * 4));
-  rawAi.push({ x, y, z, dist, sideLeft, sideRight });
+  const camber = aiBuf.readFloatLE(eOff + 7 * 4);
+  rawAi.push({ x, y, z, dist, speedMs, gas, brake, radius, sideLeft, sideRight, camber });
 }
 
 // Compute tangents & smooth lateral center shift so the track centerline is C2 smooth
@@ -717,6 +793,9 @@ for (let i = 0; i < numAiPoints; i += STEP) {
     w: Number(width.toFixed(2)),
     b: Number(banking.toFixed(4)),
     g: centerHit.prio === 1 ? 0.99 : 1.0,
+    v: Number((pt.speedMs * 3.6).toFixed(1)),
+    gas: Number(pt.gas.toFixed(3)),
+    brk: Number(pt.brake.toFixed(3)),
   });
 }
 
@@ -805,13 +884,17 @@ function shouldExcludeMesh(mesh, mat) {
     return true;
   }
 
-  const { buf, vByteStart, vCount } = mesh;
+  const { buf, vByteStart, vCount, worldMatrix } = mesh;
   if (vCount === 0) return true;
   let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
   for (let v = 0; v < vCount; v += Math.max(1, Math.floor(vCount / 50))) {
     const off = vByteStart + v * 44;
-    const x = buf.readFloatLE(off);
-    const z = buf.readFloatLE(off + 8);
+    const [x, , z] = transformPointMat4(
+      buf.readFloatLE(off),
+      buf.readFloatLE(off + 4),
+      buf.readFloatLE(off + 8),
+      worldMatrix
+    );
     if (x < minX) minX = x;
     if (x > maxX) maxX = x;
     if (z < minZ) minZ = z;
@@ -892,7 +975,7 @@ function addKn5Meshes(kn5) {
       batches.set(batchKey, batch);
     }
 
-    const { buf, vByteStart, vCount, iByteStart, iCount } = mesh;
+    const { buf, vByteStart, vCount, iByteStart, iCount, worldMatrix } = mesh;
     const localToBatchIdx = new Uint32Array(vCount);
 
     const isSolidColor =
@@ -911,20 +994,31 @@ function addKn5Meshes(kn5) {
     } else if (batch.isKerbOrLine) {
       posScale = 1.5;
       uvScale = isSolidColor ? 0.0 : 1.5;
-    } else if (/metal_d|fences2|guardrail|tent|grandstand|trans|bush|verde|hospitality|jumbotron|radiomast/i.test(batch.key)) {
+    } else if (/fences2/i.test(batch.key)) {
+      posScale = 0.40;
+      uvScale = isSolidColor ? 0.0 : 0.45;
+    } else if (/metal_d|guardrail|tent|grandstand|trans|bush|verde|hospitality|jumbotron|radiomast/i.test(batch.key)) {
       posScale = 0.55;
       uvScale = isSolidColor ? 0.0 : 0.8;
     }
 
-
     for (let v = 0; v < vCount; v++) {
       const off = vByteStart + v * 44;
-      const px = buf.readFloatLE(off) - ORIGIN_X;
-      const py = buf.readFloatLE(off + 4) - ORIGIN_Y;
-      const pz = buf.readFloatLE(off + 8) - ORIGIN_Z;
-      const nx = buf.readFloatLE(off + 12);
-      const ny = buf.readFloatLE(off + 16);
-      const nz = buf.readFloatLE(off + 20);
+      const [wx, wy, wz] = transformPointMat4(
+        buf.readFloatLE(off),
+        buf.readFloatLE(off + 4),
+        buf.readFloatLE(off + 8),
+        worldMatrix
+      );
+      const px = wx - ORIGIN_X;
+      const py = wy - ORIGIN_Y;
+      const pz = wz - ORIGIN_Z;
+      const [nx, ny, nz] = transformNormalMat4(
+        buf.readFloatLE(off + 12),
+        buf.readFloatLE(off + 16),
+        buf.readFloatLE(off + 20),
+        worldMatrix
+      );
       const u = buf.readFloatLE(off + 24);
       const uvV = buf.readFloatLE(off + 28);
 
