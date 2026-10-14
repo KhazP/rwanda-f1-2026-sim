@@ -153,7 +153,7 @@ export interface CarTelemetry {
   rearDownforceN: number;
   groundEffectFactor: number;
   dragN: number;
-  // 2026 Power Unit (400kW ICE + 350kW MGU-K)
+  // 2026 Power Unit (~540 kW ICE + 350 kW MGU-K)
   icePowerKw: number;
   mgukPowerKw: number; // -350 (harvest) to +350 (deploy)
   totalPowerKw: number;

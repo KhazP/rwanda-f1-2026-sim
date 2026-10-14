@@ -1,17 +1,27 @@
 /**
- * 2026 FIA Formula 1 Physics Solver (`f1-physics-2026.ts`)
+ * 2026 Formula 1 vehicle dynamics — Sim Dream "Grand Prix 2026 VF26" physics (`f1-physics-2026.ts`)
  *
- * Implements a fixed-timestep sub-stepped (`dt = 0.002s` / 500 Hz) 4-wheel rigid-body
- * vehicle dynamics engine ported from:
- * - TORCS / Speed Dreams `simuv4` & `simuv5` (`simu.cpp`, `car.cpp`, `wheel.cpp`, `susp.cpp`,
- *   `axle.cpp`, `aero.cpp`, `engine.cpp`, `transmission.cpp`, `differential.cpp`, `brake.cpp`, `steer.cpp`)
- * - `assetto_corsa_gym` (`AssettoCorsaEnv/ac_env.py`, `track_occupancy_grid.py`, `reference_lap.py`)
+ * A clean, assist-free rigid-body vehicle model in the spirit of Assetto Corsa / rFactor / iRacing,
+ * driven entirely by the parameters extracted from the VF26 Assetto Corsa EVO mod
+ * (see `src/lib/sim/vf26-data.ts` for every value and its provenance).
  *
- * Sub-step Integration Order (matching `SimUpdateSingleCar` in `simu.cpp`):
- * `ctrlCheck -> SimSteerUpdate -> SimGearboxUpdate -> SimEngineUpdateTq -> SimCarUpdateWheelPos
- *  -> SimBrakeSystemUpdate -> SimAeroUpdate -> SimWingUpdate -> SimWheelUpdateRide
- *  -> SimAxleUpdate -> SimWheelUpdateForce -> SimDifferentialUpdate -> SimWheelUpdateRotation
- *  -> SimCarUpdate (Forces, Speed, Pos)`
+ * Model overview (fixed 500 Hz outer step, 4 × 2 kHz inner sub-steps):
+ * - Chassis:      planar 3-DOF (vx, vy, yaw) on the local road plane + sprung heave / pitch / roll
+ *                 with Kunos box inertia; gravity (slope / banking) and vertical-curvature loads.
+ * - Suspension:   4 corner springs (progressive), slow/fast bump & rebound dampers, bump rubbers,
+ *                 droop limits, front/rear heave (third) elements with packers, anti-roll bars,
+ *                 roll centres computed from the mod's double-wishbone hardpoints.
+ * - Unsprung:     4 hub masses on radial tyre springs/dampers (kerb strikes, wheel lift).
+ * - Tyres:        AC-style load-sensitive combined-slip model with falloff, camber, thermal curve,
+ *                 relaxation-length carcass (no low-speed hacks needed).
+ * - Aero:         11 AC wing elements (AoA & ground-height LUTs, yaw sensitivity) incl. 2026 X/Z-mode.
+ * - Power unit:   ICE torque × (1 + turbo boost), MGU-K deploy/harvest with the mod's ERS controller
+ *                 curves, 4 MJ store, 350 kW limit, brake-by-wire blending on the rear axle.
+ * - Drivetrain:   seamless 8-speed, auto-clutch launch, limited-slip differential, engine inertia.
+ * - Brakes:       AC max-torque / bias model with disc thermal state.
+ *
+ * Nothing in here steers, stabilises or damps the car artificially. Driver aids (TC / ABS) only exist
+ * when the player selects them and they act exactly like real ECU aids — on pedal inputs.
  */
 
 import * as THREE from 'three';
@@ -21,6 +31,7 @@ import type {
   CarTelemetry,
   ControlInputs,
   DriverAssistPreset,
+  ERSMode,
   SurfaceType,
   TireCompound,
 } from '@/types/f1';
@@ -30,139 +41,219 @@ import {
   type BuiltTrackData,
   evaluateSampleLateralHeightM,
   getRwandaTrackData,
-  TRACK_TOTAL_LENGTH_M,
 } from './track-data';
+import { Lut } from './sim/lut';
 import {
-  FIA_2026_F1_CAR_CONFIG,
-  SimCarConfig,
-  WheelCornerIndex,
-} from './sim/car-configs';
-import { initSimAeroState, SimAeroState, updateSimAero } from './sim/aero';
+  computeRollCentreHeight,
+  VF26_ACTIVE_AERO_TRANSITION_S,
+  VF26_BRAKES,
+  VF26_CHASSIS,
+  VF26_DRIVETRAIN,
+  VF26_ENGINE,
+  VF26_ERS,
+  VF26_TYRES,
+  type Vf26AxleSuspension,
+} from './sim/vf26-data';
+import { createWingRuntimes, VF26_CG_HEIGHT_M, type WingRuntime, wingAngleDeg } from './sim/vf26-aero';
 import {
-  initAxleState,
-  initSuspensionState,
-  SimAxleState,
-  simAxleUpdate,
-  SimSuspensionState,
-} from './sim/susp';
+  computeTyreForces,
+  createTyreRuntime,
+  setTyreSpec,
+  updateTyreThermal,
+} from './sim/ac-tyre';
+import type { VehicleWheelState, WheelCornerIndex } from './sim/vehicle-types';
 import {
-  initDrivetrainState,
-   simBrakeSystemUpdate,
-  simDifferentialUpdate,
-  SimDrivetrainState,
-  simEngineUpdateTq,
-  simGearboxUpdate,
-  simSteerUpdate,
-} from './sim/drivetrain';
-import {
-  initWheelState,
-  SimWheelState,
-  simWheelUpdateForce,
-  simWheelUpdateRide,
-  simWheelUpdateRotation,
-  updateWheelCompoundParams,
-} from './sim/wheel';
-import {
-  AssettoCorsaGymObservation,
+  type AssettoCorsaGymObservation,
   computeLookaheadVectors,
   evaluateDynamicBrakingUrgency,
   queryWheelGroundContact,
 } from './sim/track-occupancy';
-import { evaluateSingleTrackMpcAi } from './sim/ai-mpc';
+import { type AiVehicleParams, RacingLineDriver } from './sim/ai-mpc';
+import {
+  aiLineOffsetM,
+  computeSpeedProfile,
+  createVf26ProfileCarModel,
+  type SpeedProfile,
+  vf26FullBrakeForceN,
+} from './sim/speed-profile';
 
-const GRAVITY = 9.81;
+export type { VehicleWheelState, WheelCornerIndex };
 
-const AERO_SETUP_MULT: Record<AeroSetupPreset, { downforce: number; drag: number }> = {
-  low_downforce: { downforce: 0.94, drag: 0.92 },
-  balanced: { downforce: 1.0, drag: 1.0 },
-  high_downforce: { downforce: 1.07, drag: 1.08 },
-};
+const G = 9.81;
+const DEG2RAD = Math.PI / 180;
+const RPM2RADS = (2 * Math.PI) / 60;
+const RADS2RPM = 60 / (2 * Math.PI);
+const AMBIENT_C = 27;
+const TRACK_SURFACE_C = 41;
+const SUBSTEPS = 4;
+const INITIAL_TYRE_TEMP_C = 82;
+const INITIAL_BRAKE_TEMP_C = 380;
+
+type ErsControllerKey = keyof typeof VF26_ERS.modes;
+
+interface ErsControllerRuntime {
+  throttle: Lut;
+  speed: Lut;
+  gear: Lut;
+  soc: Lut;
+  coastHarvest: number;
+}
+
+interface AxleRuntime {
+  spec: Vf26AxleSuspension;
+  rollCentreHeight: number;
+  /** Static sprung load carried by each corner spring (N) */
+  staticSpringForce: number;
+  /** Static spring deflection (m) */
+  staticSpringDeflection: number;
+  /** Static tyre load per wheel (N) */
+  staticTyreLoad: number;
+  tyreRate: number;
+  tyreDamp: number;
+}
+
+interface DrivetrainRuntime {
+  gear: number;
+  shiftTarget: number;
+  shiftTimerS: number;
+  autoShiftCooldownS: number;
+  engineOmega: number;
+  clutchLocked: boolean;
+  clutchEngagement: number;
+  /** Throttle pedal before traction control (sets the auto-clutch launch window) */
+  launchPedal: number;
+  boostBar: number;
+  iceTorqueNm: number;
+  mgukTorqueNm: number;
+  mgukPowerW: number;
+  harvestAxleTorqueNm: number;
+  limiterCut: boolean;
+  fuelKg: number;
+  ersMode: ERSMode;
+  ersEnergyJ: number;
+  boostRemainingS: number;
+  boostCooldownS: number;
+  diffLockedFraction: number;
+}
 
 export class F1Physics2026 {
-  /** Fixed 500 Hz simulation sub-step (`dt = 0.002s`) decoupled from render FPS */
+  /** Fixed 500 Hz simulation step decoupled from render FPS */
   public static readonly FIXED_DT = 0.002;
 
   private track: BuiltTrackData;
-  public readonly config: SimCarConfig;
   private timeAccumulator = 0;
 
-  // Chassis constants exposed for camera/HUD compatibility
-  public readonly massKg: number;
-  public readonly wheelbaseM: number = 3.4;
-  public readonly wheeltrackM: number = 1.57;
-  public readonly cgToFrontAxleM: number = 1.853;
-  public readonly cgToRearAxleM: number = 1.547;
-  public readonly cgHeightM: number = 0.275;
-  public readonly yawInertiaKgM2: number = 1060;
+  // Chassis constants (exposed for camera / HUD / AI)
+  public readonly massKg: number = VF26_CHASSIS.totalMassKg;
+  public readonly wheelbaseM: number = VF26_CHASSIS.wheelbase;
+  public readonly wheeltrackM: number = (VF26_CHASSIS.front.track + VF26_CHASSIS.rear.track) * 0.5;
+  public readonly cgToFrontAxleM: number = VF26_CHASSIS.wheelbase * (1 - VF26_CHASSIS.frontWeightFraction);
+  public readonly cgToRearAxleM: number = VF26_CHASSIS.wheelbase * VF26_CHASSIS.frontWeightFraction;
+  public readonly cgHeightM: number = VF26_CG_HEIGHT_M;
+  public readonly maxSteerAngleRad: number =
+    (VF26_CHASSIS.steering.lockDeg / VF26_CHASSIS.steering.ratio) * DEG2RAD;
+  public yawInertiaKgM2 = 0;
+  private pitchInertiaKgM2 = 0;
+  private rollInertiaKgM2 = 0;
 
-  public aeroPreset: AeroSetupPreset = 'low_downforce';
-  public assistPreset: DriverAssistPreset = 'pro';
+  public aeroPreset: AeroSetupPreset = 'balanced';
+  public assistPreset: DriverAssistPreset = 'semi_pro';
   public tireCompound: TireCompound = 'soft';
   public autoGearbox = true;
 
-  // Vehicle State (3D Cartesian World + Projected Curvilinear Track State)
+  // Vehicle state (3D Cartesian world + projected curvilinear track state)
   public worldX = 0;
   public worldZ = 0;
-  public worldYawRad = 0; // Horizontal world heading angle atan2(forward.x, forward.z) (rad)
+  public worldYawRad = 0; // atan2(forward.x, forward.z)
   public sMeters = 45;
   public lateralOffsetM = 0;
-  public headingErrorRad = 0; // Positive = nose pointed right of track tangent
+  public headingErrorRad = 0; // + = nose pointed right of track tangent
   private lastSyncedSMeters = 45;
   private lastSyncedLateralOffsetM = 0;
   private lastSyncedHeadingErrorRad = 0;
-  public vxMs = 0; // Longitudinal velocity in car body frame (m/s)
-  public vyMs = 0; // Lateral velocity in car body frame (m/s, +left in TORCS, we also expose lateralG)
-  public vzMs = 0; // Vertical velocity (m/s)
-  public yawRateRadS = 0; // World yaw angular velocity (rad/s, +turning right for UI compatibility)
-  public steerAngleNorm = 0; // [-1..1], +1 = Right, -1 = Left
-  public frontWheelAngleRad = 0; // Actual front wheel steer angle (+ = right)
-  public ffbTorqueNorm = 0; // [-1..1] normalized steering rack Force Feedback torque
+  public vxMs = 0; // body-frame longitudinal velocity (m/s)
+  public vyMs = 0; // body-frame lateral velocity (m/s, + = left)
+  public vzMs = 0;
+  public yawRateRadS = 0; // + = turning right (UI convention)
+  public steerAngleNorm = 0; // [-1..1], + = right
+  public frontWheelAngleRad = 0; // + = right
+  public ffbTorqueNorm = 0;
   public frontSlipRatioNorm = 0;
   public rearSlipRatioNorm = 0;
 
-  private rawSteerFiltered = 0;
+  // Sprung-body attitude relative to the road plane
+  public pitchRad = 0; // + = nose up
+  public rollRad = 0; // + = rolled toward the right (left-hand corner)
+  public pitchVelRadS = 0;
+  public rollVelRadS = 0;
+  public rideHeightOffsetM = 0;
+  private heaveM = 0;
+  private heaveVelMs = 0;
+
+  private steerRoadWheelRad = 0; // + = left (body convention)
   private lastAxMs2 = 0;
   private lastAyMs2 = 0;
   private prevShiftUp = false;
   private prevShiftDown = false;
   private prevToggleXMode = false;
+  private tcCut = 1;
+  private aiBrakeTrim = 1;
+  private aiThrottleTrim = 1;
+  private readonly aiDriver = new RacingLineDriver();
+  private aiProfile: { preset: AeroSetupPreset; profile: SpeedProfile; params: AiVehicleParams } | null = null;
+  private aiTargetSpeedKmh = 0;
+  /** Time the AI car has been (nearly) stationary — beached or spun off */
+  private aiStuckS = 0;
+  private aiFrontCourseRad = 0;
+  /** Low-passed cross-slope of the road plane the chassis is referenced to (rad) */
+  private planeBankRad = 0;
+  private absFactor: [number, number, number, number] = [1, 1, 1, 1];
+  private xModeBlend = 0;
+  private airDensity = 1.06;
+  private gravityBody = { x: 0, y: 0, n: G };
+  private verticalCurvature = 0;
+  private lastFyFront = 0;
+  private lastFyRear = 0;
+  private lastFxTyres = 0;
 
-  // 3D Chassis Attitude (Pitch, Roll, Vertical Heave from 4-corner suspension)
-  public pitchRad = 0;
-  public rollRad = 0;
-  public pitchVelRadS = 0;
-  public rollVelRadS = 0;
-  public rideHeightOffsetM = 0;
+  // Aero results (outer step)
+  private aeroDownforceN = 0;
+  private aeroFrontDownforceN = 0;
+  private aeroRearDownforceN = 0;
+  private aeroDragN = 0;
+  private aeroSideCoef = 0;
+  private aeroPitchMomentNm = 0;
+  private groundEffectFactor = 1;
 
-  // Subsystems ported from Speed Dreams simuv5
-  public aeroState: SimAeroState;
-  public drivetrain: SimDrivetrainState;
-  public suspensions: [
-    SimSuspensionState,
-    SimSuspensionState,
-    SimSuspensionState,
-    SimSuspensionState,
-  ];
-  public axles: [SimAxleState, SimAxleState];
-  public wheels: [SimWheelState, SimWheelState, SimWheelState, SimWheelState];
+  private readonly wings: WingRuntime[];
+  private readonly axles: [AxleRuntime, AxleRuntime];
+  private readonly torqueLut = new Lut(VF26_ENGINE.torqueCurve);
+  private readonly coastLut = new Lut(VF26_ENGINE.coastCurve);
+  private readonly boostLut = new Lut(VF26_ENGINE.boostCurve);
+  private readonly kineticLut = new Lut(VF26_ERS.kineticTorque);
+  private readonly ersControllers: Record<ErsControllerKey, ErsControllerRuntime>;
+  private sprungMassKg = 0;
+  private totalMassKg = 0;
+
+  public wheels: [VehicleWheelState, VehicleWheelState, VehicleWheelState, VehicleWheelState];
+  public drivetrain: DrivetrainRuntime;
   public lastObservation: AssettoCorsaGymObservation;
 
-  // Legacy property mirrors for external readers
-  public rpm = 4200;
+  // Mirrors for external readers
+  public rpm: number = VF26_ENGINE.idleRpm;
   public gear = 1;
-  public shiftCooldownS = 0;
-  public ersEnergyJ = 4_000_000;
-  public readonly maxErsEnergyJ = 4_000_000;
+  public ersEnergyJ: number = VF26_ERS.batteryJ;
+  public readonly maxErsEnergyJ: number = VF26_ERS.batteryJ;
   public activeAeroMode: ActiveAeroMode = 'Z_MODE';
   public autoXMode = true;
   public aiAutopilot = false;
 
-  // Three.js World Transform outputs
+  // Three.js world transform outputs
   public worldPosition = new THREE.Vector3();
   public worldQuaternion = new THREE.Quaternion();
   public wheelRotationRad = 0;
 
-  // Lap & Sector Timing
+  // Lap & sector timing
   private currentLapStartMs = 0;
   private currentSectorStartMs = 0;
   private lastSector: 1 | 2 | 3 = 1;
@@ -171,49 +262,89 @@ export class F1Physics2026 {
 
   public telemetry: CarTelemetry;
 
-  constructor(
-    track: BuiltTrackData = getRwandaTrackData(),
-    config: SimCarConfig = FIA_2026_F1_CAR_CONFIG
-  ) {
+  constructor(track: BuiltTrackData = getRwandaTrackData()) {
     this.track = track;
-    this.config = config;
-    this.massKg = config.dryMassKg;
 
-    // Initialize TORCS/Speed Dreams subsystems
-    const totalWeightN = (config.dryMassKg + config.initialFuelKg) * GRAVITY;
-    const wf0 = totalWeightN * config.frontWeightRep;
-    const wr0 = totalWeightN * (1.0 - config.frontWeightRep);
+    this.wings = createWingRuntimes();
 
-    this.aeroState = initSimAeroState(config.aero);
-    this.drivetrain = initDrivetrainState(config);
-    this.suspensions = [
-      initSuspensionState(config.suspensions[0], wf0 * 0.5),
-      initSuspensionState(config.suspensions[1], wf0 * 0.5),
-      initSuspensionState(config.suspensions[2], wr0 * 0.5),
-      initSuspensionState(config.suspensions[3], wr0 * 0.5),
-    ];
+    const mkCtrl = (k: ErsControllerKey): ErsControllerRuntime => ({
+      throttle: new Lut(VF26_ERS.modes[k].throttle),
+      speed: new Lut(VF26_ERS.modes[k].speed),
+      gear: new Lut(VF26_ERS.modes[k].gear),
+      soc: new Lut(VF26_ERS.modes[k].soc),
+      coastHarvest: VF26_ERS.modes[k].coastHarvest,
+    });
+    this.ersControllers = { RAC: mkCtrl('RAC'), BAL: mkCtrl('BAL'), PSH: mkCtrl('PSH'), CHR: mkCtrl('CHR') };
+
+    const tyres = VF26_TYRES[this.tireCompound];
+    const mkAxle = (spec: Vf26AxleSuspension, radius: number, rate: number, damp: number): AxleRuntime => ({
+      spec,
+      rollCentreHeight: computeRollCentreHeight(spec, radius),
+      staticSpringForce: 0,
+      staticSpringDeflection: 0,
+      staticTyreLoad: 0,
+      tyreRate: rate,
+      tyreDamp: damp,
+    });
     this.axles = [
-      initAxleState(config.axles[0], this.suspensions[0].spring.x0),
-      initAxleState(config.axles[1], this.suspensions[2].spring.x0),
+      mkAxle(VF26_CHASSIS.front, tyres.front.radius, tyres.front.rate, tyres.front.damp),
+      mkAxle(VF26_CHASSIS.rear, tyres.rear.radius, tyres.rear.rate, tyres.rear.damp),
     ];
 
-    // Symmetric static GC offset (x = 0 at CG, y = 0 on centerline)
-    this.wheels = [
-      initWheelState(0, config.wheels[0], 0, 0, this.tireCompound),
-      initWheelState(1, config.wheels[1], 0, 0, this.tireCompound),
-      initWheelState(2, config.wheels[2], 0, 0, this.tireCompound),
-      initWheelState(3, config.wheels[3], 0, 0, this.tireCompound),
-    ];
+    const a = this.cgToFrontAxleM;
+    const b = this.cgToRearAxleM;
+    const tf = VF26_CHASSIS.front.track * 0.5;
+    const tr = VF26_CHASSIS.rear.track * 0.5;
+    const mkWheel = (index: WheelCornerIndex, x: number, y: number): VehicleWheelState => {
+      const isFront = index < 2;
+      const spec = isFront ? tyres.front : tyres.rear;
+      return {
+        index,
+        isFront,
+        isLeft: index % 2 === 1,
+        staticPos: { x, y },
+        worldPos: { x: 0, y: 0, z: 0 },
+        zRoad: 0,
+        surfaceType: 'asphalt',
+        surfaceFrictionMult: 1,
+        surfaceBumpM: 0,
+        roadOffsetPrev: 0,
+        roadOffset: 0,
+        steerRad: 0,
+        spinVel: 0,
+        rotationRad: 0,
+        fzN: 0,
+        ftN: 0,
+        fnN: 0,
+        slipRatio: 0,
+        slipAngleRad: 0,
+        combinedSlipNorm: 0,
+        effectiveMu: spec.dyRef,
+        gripFactor: 1,
+        torqueAlignNm: 0,
+        rideHeight: (isFront ? VF26_CHASSIS.front : VF26_CHASSIS.rear).staticRideHeight,
+        suspCompression: 0,
+        suspCompressionVel: 0,
+        hubZ: 0,
+        hubZVel: 0,
+        camberLeftRad: 0,
+        brakeTorqueNm: 0,
+        brakeTempC: INITIAL_BRAKE_TEMP_C,
+        tyre: createTyreRuntime(spec, INITIAL_TYRE_TEMP_C),
+      };
+    };
+    this.wheels = [mkWheel(0, a, -tf), mkWheel(1, a, tf), mkWheel(2, -b, -tr), mkWheel(3, -b, tr)];
 
-    // Eliminate static toe on straights so left/right lateral forces are 100% zero when steer = 0
-    for (let i = 0; i < 4; i++) {
-      this.config.wheels[i].toeRad = 0;
-    }
-
+    this.drivetrain = this.createDrivetrain();
+    this.recomputeMassProperties();
     this.telemetry = this.createInitialTelemetry();
     this.lastObservation = this.buildObservation(this.track.getSampleAtDistance(35));
     this.resetToStartGrid(false);
   }
+
+  // ===========================================================================
+  // Public API
+  // ===========================================================================
 
   public getTelemetry(): CarTelemetry {
     return this.telemetry;
@@ -221,38 +352,1332 @@ export class F1Physics2026 {
 
   public setAssistPreset(preset: DriverAssistPreset): void {
     this.assistPreset = preset;
-    this.config.brakeSystem.enableAbs = preset !== 'pro';
   }
 
-  /**
-   * Triggers the 2026 FIA Manual Override Mode (`/boost` — 350 kW MGU-K sustained to 337 km/h)
-   */
+  /** 2026 Manual Override Mode: full MGU-K deployment sustained to 337 km/h for 8 s */
   public activateBoostOverride(): boolean {
-    const eng = this.drivetrain.engine;
-    if (eng.ersEnergyJ > 200_000 && eng.boostCooldownS <= 0) {
-      eng.ersMode = 'OVERRIDE';
-      eng.boostRemainingS = 8.0;
+    const dt = this.drivetrain;
+    if (dt.ersEnergyJ > 200_000 && dt.boostCooldownS <= 0) {
+      dt.ersMode = 'OVERRIDE';
+      dt.boostRemainingS = 8.0;
       return true;
     }
     return false;
   }
 
+  public resetToStartGrid(flyingStart = false): void {
+    this.placeCar(flyingStart ? 50 : 35, flyingStart ? 75 : 0, 0);
+    this.activeAeroMode = flyingStart ? 'X_MODE' : 'Z_MODE';
+    this.xModeBlend = flyingStart ? 1 : 0;
+    this.drivetrain = this.createDrivetrain();
+    this.drivetrain.gear = flyingStart ? 7 : 1;
+    this.drivetrain.shiftTarget = this.drivetrain.gear;
+    this.syncDrivetrainToRoadSpeed();
+    this.ersEnergyJ = this.drivetrain.ersEnergyJ;
+    this.simTimeMs = 0;
+    this.currentLapStartMs = 0;
+    this.currentSectorStartMs = 0;
+    this.lapValid = true;
+    this.settleSuspension();
+    this.finishPlacement();
+  }
+
+  public teleportToDistance(sMeters: number, speedMs = 0): void {
+    const wrapped = ((sMeters % this.track.totalLengthM) + this.track.totalLengthM) % this.track.totalLengthM;
+    this.placeCar(wrapped, Math.max(0, speedMs), 0);
+    const dt = this.drivetrain;
+    dt.gear = this.selectGearForSpeed(this.vxMs);
+    dt.shiftTarget = dt.gear;
+    dt.shiftTimerS = 0;
+    this.syncDrivetrainToRoadSpeed();
+    this.settleSuspension();
+    this.finishPlacement();
+  }
+
+  public teleportToTurn(turnNumber: number): void {
+    const idx = this.track.samples.findIndex((s) => s.turnNumber === turnNumber);
+    const target = idx >= 0 ? this.track.samples[(idx + 2) % this.track.samples.length] : this.track.samples[0];
+    const speedMs = Math.min(62, target.optimalSpeedKmh / 3.6);
+    this.teleportToDistance(target.s, speedMs);
+    this.lateralOffsetM = aiLineOffsetM(target);
+    this.syncCartesianFromCurvilinear();
+    this.syncWorldTransform();
+  }
+
+  /**
+   * Main frame entry point. Accumulates the frame delta and steps the solver at a strict
+   * fixed 500 Hz, completely decoupled from render FPS.
+   */
+  public step(dtSeconds: number, rawInputs: Partial<ControlInputs>): CarTelemetry {
+    if (!Number.isFinite(dtSeconds) || dtSeconds <= 0) {
+      return this.telemetry;
+    }
+
+    // If the caller moved the car directly along the track, rebuild the Cartesian pose
+    if (
+      this.sMeters !== this.lastSyncedSMeters ||
+      this.lateralOffsetM !== this.lastSyncedLateralOffsetM ||
+      this.headingErrorRad !== this.lastSyncedHeadingErrorRad
+    ) {
+      this.syncCartesianFromCurvilinear();
+    }
+
+    this.applyCompound();
+
+    this.timeAccumulator += Math.min(dtSeconds, 0.05);
+
+    const inputs: ControlInputs = {
+      throttle: THREE.MathUtils.clamp(rawInputs.throttle ?? 0, 0, 1),
+      brake: THREE.MathUtils.clamp(rawInputs.brake ?? 0, 0, 1),
+      steerLeft: THREE.MathUtils.clamp(rawInputs.steerLeft ?? 0, 0, 1),
+      steerRight: THREE.MathUtils.clamp(rawInputs.steerRight ?? 0, 0, 1),
+      analogSteer:
+        rawInputs.analogSteer !== undefined ? THREE.MathUtils.clamp(rawInputs.analogSteer, -1, 1) : undefined,
+      clutch: rawInputs.clutch,
+      manualOverride: Boolean(rawInputs.manualOverride),
+      toggleXMode: Boolean(rawInputs.toggleXMode),
+      shiftUp: Boolean(rawInputs.shiftUp),
+      shiftDown: Boolean(rawInputs.shiftDown),
+    };
+
+    if (inputs.toggleXMode && !this.prevToggleXMode) {
+      this.autoXMode = false;
+      this.activeAeroMode = this.activeAeroMode === 'Z_MODE' ? 'X_MODE' : 'Z_MODE';
+    }
+    this.prevToggleXMode = inputs.toggleXMode;
+
+    let shiftReq: -1 | 0 | 1 = 0;
+    if (inputs.shiftUp && !this.prevShiftUp) shiftReq = 1;
+    else if (inputs.shiftDown && !this.prevShiftDown) shiftReq = -1;
+    this.prevShiftUp = inputs.shiftUp;
+    this.prevShiftDown = inputs.shiftDown;
+
+    let stepsRun = 0;
+    while (this.timeAccumulator >= F1Physics2026.FIXED_DT && stepsRun < 30) {
+      this.outerStep(F1Physics2026.FIXED_DT, inputs, stepsRun === 0 ? shiftReq : 0);
+      this.timeAccumulator -= F1Physics2026.FIXED_DT;
+      this.simTimeMs += F1Physics2026.FIXED_DT * 1000;
+      stepsRun++;
+    }
+    if (stepsRun === 0 && dtSeconds < F1Physics2026.FIXED_DT) {
+      this.outerStep(dtSeconds, inputs, shiftReq);
+      this.timeAccumulator = 0;
+      this.simTimeMs += dtSeconds * 1000;
+    }
+
+    this.syncWorldTransform();
+    this.recoverStuckAi(dtSeconds);
+    const currentSample = this.track.getSampleAtDistance(this.sMeters);
+    this.lastObservation = this.buildObservation(currentSample);
+    this.updateTelemetrySnapshot(currentSample, inputs);
+    return this.telemetry;
+  }
+
+  /** Autopilot only: a car stopped for 3 s (beached, spun into the barrier) is put back on the AI line */
+  private recoverStuckAi(dtSeconds: number): void {
+    if (!this.aiAutopilot) {
+      this.aiStuckS = 0;
+      return;
+    }
+    this.aiStuckS = Math.hypot(this.vxMs, this.vyMs) < 2 ? this.aiStuckS + Math.min(dtSeconds, 0.05) : 0;
+    if (this.aiStuckS < 3) return;
+    this.aiStuckS = 0;
+    const sample = this.track.getSampleAtDistance(this.sMeters);
+    this.teleportToDistance(this.sMeters, Math.min(15, sample.optimalSpeedKmh / 3.6));
+    this.lateralOffsetM = aiLineOffsetM(sample);
+    this.syncCartesianFromCurvilinear();
+    this.syncWorldTransform();
+  }
+
+  // ===========================================================================
+  // Setup / placement helpers
+  // ===========================================================================
+
+  private createDrivetrain(): DrivetrainRuntime {
+    return {
+      gear: 1,
+      shiftTarget: 1,
+      shiftTimerS: 0,
+      autoShiftCooldownS: 0,
+      engineOmega: VF26_ENGINE.idleRpm * RPM2RADS,
+      clutchLocked: false,
+      clutchEngagement: 0,
+      launchPedal: 0,
+      boostBar: 0,
+      iceTorqueNm: 0,
+      mgukTorqueNm: 0,
+      mgukPowerW: 0,
+      harvestAxleTorqueNm: 0,
+      limiterCut: false,
+      fuelKg: VF26_CHASSIS.fuelKg,
+      ersMode: 'BALANCED',
+      ersEnergyJ: VF26_ERS.batteryJ,
+      boostRemainingS: 0,
+      boostCooldownS: 0,
+      diffLockedFraction: 0,
+    };
+  }
+
+  private recomputeMassProperties(): void {
+    const fuel = this.drivetrain.fuelKg;
+    const m = VF26_CHASSIS.totalMassKg + fuel;
+    this.totalMassKg = m;
+    const unsprung = 2 * VF26_CHASSIS.front.unsprungMassKg + 2 * VF26_CHASSIS.rear.unsprungMassKg;
+    this.sprungMassKg = m - unsprung;
+    const box = VF26_CHASSIS.inertiaBox;
+    // Kunos convention: inertia of a uniform box of the car's mass
+    this.yawInertiaKgM2 = (m * (box.width ** 2 + box.length ** 2)) / 12;
+    this.pitchInertiaKgM2 = (m * (box.height ** 2 + box.length ** 2)) / 12;
+    this.rollInertiaKgM2 = (m * (box.width ** 2 + box.height ** 2)) / 12;
+
+    const weight = m * G;
+    const frontAxleLoad = weight * VF26_CHASSIS.frontWeightFraction;
+    const rearAxleLoad = weight - frontAxleLoad;
+    const setAxle = (ax: AxleRuntime, axleLoad: number) => {
+      ax.staticTyreLoad = axleLoad * 0.5;
+      ax.staticSpringForce = ax.staticTyreLoad - ax.spec.unsprungMassKg * G;
+      ax.staticSpringDeflection = ax.staticSpringForce / ax.spec.springRate;
+    };
+    setAxle(this.axles[0], frontAxleLoad);
+    setAxle(this.axles[1], rearAxleLoad);
+  }
+
+  private applyCompound(): void {
+    const set = VF26_TYRES[this.tireCompound];
+    for (const w of this.wheels) {
+      setTyreSpec(w.tyre, w.isFront ? set.front : set.rear);
+    }
+    this.axles[0].tyreRate = set.front.rate;
+    this.axles[0].tyreDamp = set.front.damp;
+    this.axles[1].tyreRate = set.rear.rate;
+    this.axles[1].tyreDamp = set.rear.damp;
+  }
+
+  private placeCar(s: number, speedMs: number, lateralOffset: number): void {
+    this.timeAccumulator = 0;
+    this.sMeters = s;
+    this.lateralOffsetM = lateralOffset;
+    this.headingErrorRad = 0;
+    this.vxMs = speedMs;
+    this.vyMs = 0;
+    this.vzMs = 0;
+    this.yawRateRadS = 0;
+    this.lastAxMs2 = 0;
+    this.lastAyMs2 = 0;
+    this.steerAngleNorm = 0;
+    this.frontWheelAngleRad = 0;
+    this.steerRoadWheelRad = 0;
+    this.ffbTorqueNorm = 0;
+    this.pitchRad = 0;
+    this.rollRad = 0;
+    this.pitchVelRadS = 0;
+    this.rollVelRadS = 0;
+    this.heaveM = 0;
+    this.heaveVelMs = 0;
+    this.tcCut = 1;
+    this.absFactor = [1, 1, 1, 1];
+    this.aiDriver.reset();
+    this.aiFrontCourseRad = 0;
+    this.aiBrakeTrim = 1;
+    this.aiThrottleTrim = 1;
+    this.lastFyFront = 0;
+    this.lastFyRear = 0;
+    this.lastFxTyres = 0;
+    this.applyCompound();
+    for (const w of this.wheels) {
+      const r = w.tyre.spec.radius;
+      w.spinVel = speedMs / r;
+      w.tyre.deflX = 0;
+      w.tyre.deflY = 0;
+      w.hubZ = 0;
+      w.hubZVel = 0;
+      w.slipRatio = 0;
+      w.slipAngleRad = 0;
+      w.combinedSlipNorm = 0;
+      w.steerRad = 0;
+    }
+    this.recomputeMassProperties();
+    this.syncCartesianFromCurvilinear();
+  }
+
+  private finishPlacement(): void {
+    const sample = this.track.getSampleAtDistance(this.sMeters);
+    this.lastSector = sample.sector;
+    this.syncWorldTransform();
+    this.updateWheelWorldPositions(sample);
+    this.lastObservation = this.buildObservation(sample);
+    this.gear = this.drivetrain.gear;
+    this.rpm = this.drivetrain.engineOmega * RADS2RPM;
+    this.ersEnergyJ = this.drivetrain.ersEnergyJ;
+    this.updateTelemetrySnapshot(sample, {
+      throttle: 0,
+      brake: 0,
+      steerLeft: 0,
+      steerRight: 0,
+      manualOverride: false,
+      toggleXMode: false,
+      shiftUp: false,
+      shiftDown: false,
+    });
+  }
+
+  private overallRatio(gear: number): number {
+    if (gear >= 1 && gear <= VF26_DRIVETRAIN.gearRatios.length) {
+      return VF26_DRIVETRAIN.gearRatios[gear - 1] * VF26_DRIVETRAIN.finalDrive;
+    }
+    if (gear === -1) return VF26_DRIVETRAIN.reverseRatio * VF26_DRIVETRAIN.finalDrive;
+    return 0;
+  }
+
+  private selectGearForSpeed(speedMs: number): number {
+    const r = VF26_TYRES.soft.rear.radius;
+    for (let g = 1; g <= 8; g++) {
+      const rpm = (speedMs / r) * this.overallRatio(g) * RADS2RPM;
+      if (rpm < 11200) return g;
+    }
+    return 8;
+  }
+
+  private syncDrivetrainToRoadSpeed(): void {
+    const dt = this.drivetrain;
+    const rearOmega = 0.5 * (this.wheels[2].spinVel + this.wheels[3].spinVel);
+    const engineFromRoad = rearOmega * this.overallRatio(dt.gear);
+    const idle = VF26_ENGINE.idleRpm * RPM2RADS;
+    if (engineFromRoad > VF26_DRIVETRAIN.autoClutchFullRpm * RPM2RADS) {
+      dt.engineOmega = engineFromRoad;
+      dt.clutchLocked = true;
+      dt.clutchEngagement = 1;
+    } else {
+      dt.engineOmega = idle;
+      dt.clutchLocked = false;
+      dt.clutchEngagement = 0;
+    }
+  }
+
+  /** Runs the vertical dynamics alone so a teleported car starts in aero/suspension equilibrium */
+  private settleSuspension(): void {
+    const sample = this.track.getSampleAtDistance(this.sMeters);
+    this.planeBankRad = this.measureLocalBank(sample);
+    this.updateWheelWorldPositions(sample);
+    this.updateRoadContacts(sample, true);
+    this.updateGravity(sample);
+    for (let i = 0; i < 600; i++) {
+      this.updateAero(F1Physics2026.FIXED_DT / SUBSTEPS);
+      this.integrateVertical(F1Physics2026.FIXED_DT / SUBSTEPS, 1, 0, 0, 0, true);
+    }
+    for (const w of this.wheels) w.roadOffsetPrev = w.roadOffset;
+  }
+
+  private syncCartesianFromCurvilinear(): void {
+    const sample = this.track.getSampleAtDistance(this.sMeters);
+    this.worldX = sample.position.x + sample.binormal.x * this.lateralOffsetM;
+    this.worldZ = sample.position.z + sample.binormal.z * this.lateralOffsetM;
+    const trackHeadingRad = Math.atan2(sample.tangent.x, sample.tangent.z);
+    this.worldYawRad = Math.atan2(
+      Math.sin(trackHeadingRad - this.headingErrorRad),
+      Math.cos(trackHeadingRad - this.headingErrorRad)
+    );
+    this.lastSyncedSMeters = this.sMeters;
+    this.lastSyncedLateralOffsetM = this.lateralOffsetM;
+    this.lastSyncedHeadingErrorRad = this.headingErrorRad;
+  }
+
+  private computeAirDensity(altitudeM: number): number {
+    return 1.225 * Math.pow(1 - 2.25577e-5 * altitudeM, 4.25588);
+  }
+
+  // ===========================================================================
+  // 500 Hz outer step
+  // ===========================================================================
+
+  private outerStep(dt: number, inputs: ControlInputs, shiftRequest: -1 | 0 | 1): void {
+    const sample = this.track.getSampleAtDistance(this.sMeters);
+    const drv = this.drivetrain;
+
+    // ---- 1. Driver / AI commands ------------------------------------------------
+    let throttle = inputs.throttle;
+    let brake = inputs.brake;
+    let steerNorm: number; // + = right
+
+    if (this.aiAutopilot) {
+      this.lastObservation = this.buildObservation(sample);
+      const plan = this.getAiPlan();
+      const ai = this.aiDriver.evaluate(this.lastObservation, this.track, this.sMeters, plan.profile, plan.params, dt);
+      // The AI holds the front tyres at (not beyond) their peak slip angle
+      // (low-passed so the limit doesn't form a fast loop with the yaw / tyre dynamics)
+      const vxSafe = Math.max(3, this.vxMs);
+      const frontCourseLeft = Math.atan2(this.vyMs - this.yawRateRadS * this.cgToFrontAxleM, vxSafe);
+      this.aiFrontCourseRad += (frontCourseLeft - this.aiFrontCourseRad) * Math.min(1, dt / 0.05);
+      const alphaLim = 1.05 * VF26_TYRES[this.tireCompound].front.frictionLimitAngleDeg * DEG2RAD;
+      const wantLeft = THREE.MathUtils.clamp(
+        ai.steerCmd * this.maxSteerAngleRad,
+        this.aiFrontCourseRad - alphaLim,
+        this.aiFrontCourseRad + alphaLim
+      );
+      steerNorm = THREE.MathUtils.clamp(-wantLeft / this.maxSteerAngleRad, -1, 1);
+      // A skilled driver bleeds off the brake when the tyres start to lock and feathers the throttle
+      // on wheelspin. Lock-up is load-weighted: a skating, nearly unloaded inside wheel carries
+      // almost no braking force, so it must not make the driver release the whole brake.
+      let lockSum = 0;
+      let fzSum = 0;
+      let lockLoaded = 0;
+      let spin = 0;
+      for (const w of this.wheels) {
+        const l = Math.max(0, -w.slipRatio);
+        lockSum += l * w.fzN;
+        fzSum += w.fzN;
+        if (w.fzN > 1500) lockLoaded = Math.max(lockLoaded, l);
+        if (!w.isFront) spin = Math.max(spin, w.slipRatio);
+      }
+      const lock = fzSum > 1 ? lockSum / fzSum : 0;
+      const brakeWant = Math.min(
+        lock > 0.09 ? Math.max(0.25, 1 - (lock - 0.09) * 8) : 1,
+        // a properly loaded wheel sliding well past its peak must be released to recover
+        lockLoaded > 0.2 ? Math.max(0.3, 1 - (lockLoaded - 0.2) * 2.5) : 1
+      );
+      this.aiBrakeTrim += (brakeWant - this.aiBrakeTrim) * Math.min(1, (brakeWant < this.aiBrakeTrim ? 40 : 8) * dt);
+      const throttleWant = spin > 0.085 ? Math.max(0.2, 1 - (spin - 0.085) * 10) : 1;
+      this.aiThrottleTrim += (throttleWant - this.aiThrottleTrim) * Math.min(1, (throttleWant < this.aiThrottleTrim ? 40 : 6) * dt);
+      throttle = ai.throttleCmd * this.aiThrottleTrim;
+      // Brake only up to what the less-loaded front tyre can take (left/right torque is equal),
+      // using the grip left over after its current cornering force
+      const frontTorqueAtFullPedal = VF26_BRAKES.maxTorqueNm * VF26_BRAKES.powerMult * VF26_BRAKES.frontBias;
+      let pedalCap = 1;
+      for (let i = 0; i < 2; i++) {
+        const w = this.wheels[i];
+        const fxMax = Math.sqrt(Math.max(0, (1.06 * w.effectiveMu * w.fzN) ** 2 - w.fnN * w.fnN));
+        pedalCap = Math.min(pedalCap, (1.05 * fxMax * w.tyre.spec.radius) / frontTorqueAtFullPedal);
+      }
+      brake = Math.min(ai.brakeCmd, Math.max(0.15, pedalCap)) * this.aiBrakeTrim;
+      this.aiTargetSpeedKmh = ai.targetSpeedKmh;
+      this.activeAeroMode = ai.aeroMode;
+      if (drv.boostRemainingS <= 0) drv.ersMode = ai.ersMode;
+    } else {
+      steerNorm = inputs.analogSteer !== undefined ? inputs.analogSteer : inputs.steerRight - inputs.steerLeft;
+
+      if (inputs.manualOverride && drv.ersEnergyJ > 0) {
+        drv.ersMode = 'OVERRIDE';
+      } else if (drv.boostRemainingS <= 0 && drv.ersMode === 'OVERRIDE') {
+        drv.ersMode = 'BALANCED';
+      }
+
+      if (this.autoXMode) {
+        const canXMode =
+          sample.drsZone && brake < 0.05 && Math.abs(steerNorm) < 0.18 && this.vxMs > 38 && throttle > 0.6;
+        this.activeAeroMode = canXMode ? 'X_MODE' : 'Z_MODE';
+      }
+    }
+
+    drv.launchPedal = throttle;
+
+    // ---- 2. Driver aids (only when selected) -----------------------------------
+    const tcTarget = this.assistPreset === 'assisted' ? 0.1 : this.assistPreset === 'semi_pro' ? 0.13 : 0;
+    if (tcTarget > 0 && this.vxMs > 2) {
+      const rearSlip = Math.max(this.wheels[2].slipRatio, this.wheels[3].slipRatio);
+      const want = rearSlip > tcTarget ? Math.max(0.15, 1 - (rearSlip - tcTarget) * 9) : 1;
+      this.tcCut += (want - this.tcCut) * Math.min(1, (want < this.tcCut ? 60 : 12) * dt);
+      throttle *= this.tcCut;
+    } else {
+      this.tcCut = 1;
+    }
+    const absTarget = this.assistPreset === 'assisted' ? 0.11 : this.assistPreset === 'semi_pro' ? 0.15 : 0;
+    for (let i = 0; i < 4; i++) {
+      let want = 1;
+      if (absTarget > 0 && this.vxMs > 3) {
+        const lock = -this.wheels[i].slipRatio;
+        if (lock > absTarget) want = Math.max(0.1, 1 - (lock - absTarget) * 12);
+      }
+      this.absFactor[i] += (want - this.absFactor[i]) * Math.min(1, (want < this.absFactor[i] ? 80 : 20) * dt);
+    }
+
+    // ---- 3. Steering rack (hands have a finite speed; parallel steer + static toe) ----
+    const targetRoad = -steerNorm * this.maxSteerAngleRad;
+    const maxRate = (VF26_CHASSIS.steering.maxWheelSpeedDegS / VF26_CHASSIS.steering.ratio) * DEG2RAD;
+    const dSteer = THREE.MathUtils.clamp(targetRoad - this.steerRoadWheelRad, -maxRate * dt, maxRate * dt);
+    this.steerRoadWheelRad += dSteer;
+    const toeF = VF26_CHASSIS.front.staticToeDeg * DEG2RAD;
+    const toeR = VF26_CHASSIS.rear.staticToeDeg * DEG2RAD;
+    this.wheels[0].steerRad = this.steerRoadWheelRad + toeF;
+    this.wheels[1].steerRad = this.steerRoadWheelRad - toeF;
+    this.wheels[2].steerRad = toeR;
+    this.wheels[3].steerRad = -toeR;
+    this.frontWheelAngleRad = -this.steerRoadWheelRad;
+    this.steerAngleNorm = THREE.MathUtils.clamp(this.frontWheelAngleRad / this.maxSteerAngleRad, -1, 1);
+
+    // ---- 4. Gearbox ---------------------------------------------------------------
+    this.updateGearbox(dt, shiftRequest, throttle, brake);
+
+    // ---- 5. Track contact, gravity, aero -------------------------------------------
+    const bankTarget = this.measureLocalBank(sample);
+    this.planeBankRad += (bankTarget - this.planeBankRad) * Math.min(1, dt / 0.08);
+    this.updateWheelWorldPositions(sample);
+    this.updateRoadContacts(sample, false);
+    this.updateGravity(sample);
+    const altitudeM = BASE_ALTITUDE_M + sample.position.y;
+    this.airDensity = this.computeAirDensity(altitudeM);
+    const xTarget = this.activeAeroMode === 'X_MODE' ? 1 : 0;
+    const aeroRate = dt / VF26_ACTIVE_AERO_TRANSITION_S;
+    this.xModeBlend += THREE.MathUtils.clamp(xTarget - this.xModeBlend, -aeroRate, aeroRate);
+    this.updateAero(dt);
+
+    // ---- 6. Power unit & brakes (controls for the sub-steps) ----------------------
+    this.updatePowerUnitControls(dt, throttle, brake);
+    const brakeDemand = brake * VF26_BRAKES.maxTorqueNm * VF26_BRAKES.powerMult;
+    const frontPerWheel = brakeDemand * VF26_BRAKES.frontBias;
+    const rearPerWheelDemand = brakeDemand * (1 - VF26_BRAKES.frontBias);
+    // Brake-by-wire: MGU-K harvest replaces part of the rear hydraulic torque. The BBW keeps the
+    // total rear torque at the (ABS-limited) demand, so harvest never adds to a locking axle.
+    const rearAbs = Math.min(this.absFactor[2], this.absFactor[3]);
+    const harvestPerWheel = Math.min(rearPerWheelDemand * rearAbs, drv.harvestAxleTorqueNm * 0.5);
+    drv.harvestAxleTorqueNm = 2 * harvestPerWheel;
+    this.wheels[0].brakeTorqueNm = frontPerWheel * this.absFactor[0];
+    this.wheels[1].brakeTorqueNm = frontPerWheel * this.absFactor[1];
+    this.wheels[2].brakeTorqueNm = Math.max(0, rearPerWheelDemand * this.absFactor[2] - harvestPerWheel);
+    this.wheels[3].brakeTorqueNm = Math.max(0, rearPerWheelDemand * this.absFactor[3] - harvestPerWheel);
+
+    // ---- 7. 2 kHz sub-steps: tyres, wheels, drivetrain, chassis, suspension -------
+    const h = dt / SUBSTEPS;
+    const prevS = this.sMeters;
+    let sumAx = 0;
+    let sumAy = 0;
+    for (let k = 0; k < SUBSTEPS; k++) {
+      const roadFrac = (k + 1) / SUBSTEPS;
+      const acc = this.subStep(h, throttle, roadFrac, dt);
+      sumAx += acc.ax;
+      sumAy += acc.ay;
+    }
+    this.lastAxMs2 += (sumAx / SUBSTEPS - this.lastAxMs2) * Math.min(1, 25 * dt);
+    this.lastAyMs2 += (sumAy / SUBSTEPS - this.lastAyMs2) * Math.min(1, 25 * dt);
+
+    // ---- 8. Thermal models, fuel ---------------------------------------------------
+    for (const w of this.wheels) {
+      const rollSpeed = w.spinVel * w.tyre.spec.radius;
+      const slipPower = Math.abs(w.ftN * (rollSpeed - this.wheelHubVx(w))) + Math.abs(w.fnN * this.wheelHubVy(w));
+      updateTyreThermal(w.tyre, slipPower, w.fzN, rollSpeed, AMBIENT_C, TRACK_SURFACE_C, dt);
+      const brakePower = w.brakeTorqueNm * Math.abs(w.spinVel);
+      const cooling = (20 + 2.6 * Math.abs(this.vxMs)) * (w.brakeTempC - AMBIENT_C);
+      w.brakeTempC += ((brakePower * 0.92 - cooling) / 2100) * dt;
+      w.brakeTempC = Math.max(AMBIENT_C, Math.min(1250, w.brakeTempC));
+    }
+    if (throttle > 0.01 && drv.fuelKg > 0) {
+      drv.fuelKg = Math.max(0, drv.fuelKg - VF26_CHASSIS.fuelFlowKgS * throttle * dt);
+    }
+    this.totalMassKg = VF26_CHASSIS.totalMassKg + drv.fuelKg;
+
+    // ---- 9. Project onto the track, barriers, timing ------------------------------
+    this.postIntegrate(prevS);
+
+    // ---- 10. Outputs ------------------------------------------------------------------
+    this.rpm = drv.engineOmega * RADS2RPM;
+    this.gear = drv.gear;
+    this.ersEnergyJ = drv.ersEnergyJ;
+    this.rideHeightOffsetM = this.heaveM;
+    this.wheelRotationRad = this.wheels[0].rotationRad;
+    this.frontSlipRatioNorm = Math.max(this.wheels[0].combinedSlipNorm, this.wheels[1].combinedSlipNorm);
+    this.rearSlipRatioNorm = Math.max(this.wheels[2].combinedSlipNorm, this.wheels[3].combinedSlipNorm);
+
+    const alignFront =
+      this.wheels[0].torqueAlignNm +
+      this.wheels[1].torqueAlignNm -
+      VF26_CHASSIS.steering.mechanicalTrail * (this.wheels[0].fnN + this.wheels[1].fnN);
+    this.ffbTorqueNorm = THREE.MathUtils.clamp((-alignFront / 650) * VF26_CHASSIS.steering.ffbMult, -1, 1);
+  }
+
+  private wheelHubVx(w: VehicleWheelState): number {
+    const r = -this.yawRateRadS;
+    const vbx = this.vxMs - r * w.staticPos.y;
+    const vby = this.vyMs + r * w.staticPos.x;
+    return vbx * Math.cos(w.steerRad) + vby * Math.sin(w.steerRad);
+  }
+
+  private wheelHubVy(w: VehicleWheelState): number {
+    const r = -this.yawRateRadS;
+    const vbx = this.vxMs - r * w.staticPos.y;
+    const vby = this.vyMs + r * w.staticPos.x;
+    return -vbx * Math.sin(w.steerRad) + vby * Math.cos(w.steerRad);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Gearbox & power unit controls
+  // ---------------------------------------------------------------------------
+
+  private updateGearbox(dt: number, shiftRequest: -1 | 0 | 1, throttle: number, brake: number): void {
+    const drv = this.drivetrain;
+    if (drv.autoShiftCooldownS > 0) drv.autoShiftCooldownS = Math.max(0, drv.autoShiftCooldownS - dt);
+
+    if (drv.shiftTimerS > 0) {
+      drv.shiftTimerS -= dt;
+      if (drv.shiftTimerS <= 0) {
+        drv.shiftTimerS = 0;
+        drv.gear = drv.shiftTarget;
+        if (drv.clutchLocked) {
+          const rearOmega = 0.5 * (this.wheels[2].spinVel + this.wheels[3].spinVel);
+          drv.engineOmega = Math.max(VF26_ENGINE.idleRpm * RPM2RADS, rearOmega * this.overallRatio(drv.gear));
+        }
+      }
+      return;
+    }
+
+    let desired = drv.gear;
+    const rearOmega = 0.5 * (this.wheels[2].spinVel + this.wheels[3].spinVel);
+    if (shiftRequest !== 0) {
+      desired = THREE.MathUtils.clamp(drv.gear + shiftRequest, 1, 8);
+      if (shiftRequest < 0) {
+        // Gearbox protection: refuse a downshift that would over-rev the engine
+        const rpmAfter = rearOmega * this.overallRatio(desired) * RADS2RPM;
+        if (rpmAfter > VF26_ENGINE.maxRpm - 500) desired = drv.gear;
+      }
+    } else if (this.autoGearbox && drv.autoShiftCooldownS <= 0) {
+      const rpm = drv.engineOmega * RADS2RPM;
+      if (drv.gear < 8 && rpm > VF26_DRIVETRAIN.autoUpshiftRpm && drv.clutchLocked && brake < 0.1) {
+        desired = drv.gear + 1;
+      } else if (drv.gear > 1) {
+        // Downshift decisions use road speed so a locking / spinning rear axle can't trigger
+        // a cascade of downshifts
+        const roadOmega = Math.max(0, this.vxMs) / this.wheels[2].tyre.spec.radius;
+        const rpmRoad = roadOmega * this.overallRatio(drv.gear) * RADS2RPM;
+        const rpmLower = Math.max(rearOmega, roadOmega) * this.overallRatio(drv.gear - 1) * RADS2RPM;
+        const wantsDown =
+          (rpmRoad < VF26_DRIVETRAIN.autoDownshiftRpm && (brake > 0.05 || throttle < 0.6)) || rpmRoad < 6200;
+        if (wantsDown && rpmLower < VF26_DRIVETRAIN.autoUpshiftRpm - 600) desired = drv.gear - 1;
+      }
+      if (desired !== drv.gear) drv.autoShiftCooldownS = 0.12;
+    }
+
+    if (desired !== drv.gear) {
+      drv.shiftTarget = desired;
+      drv.shiftTimerS = desired > drv.gear ? VF26_DRIVETRAIN.upshiftTimeS : VF26_DRIVETRAIN.downshiftTimeS;
+    }
+  }
+
+  private ersController(): { ctrl: ErsControllerRuntime; override: boolean } {
+    const mode = this.drivetrain.ersMode;
+    if (mode === 'HOTLAP') return { ctrl: this.ersControllers.PSH, override: false };
+    if (mode === 'HARVEST') return { ctrl: this.ersControllers.CHR, override: false };
+    if (mode === 'OVERRIDE') return { ctrl: this.ersControllers.PSH, override: true };
+    return { ctrl: this.ersControllers.RAC, override: false };
+  }
+
+  private updatePowerUnitControls(dt: number, throttle: number, brake: number): void {
+    const drv = this.drivetrain;
+    const rpm = drv.engineOmega * RADS2RPM;
+    const speedKmh = Math.abs(this.vxMs) * 3.6;
+
+    if (drv.boostCooldownS > 0) drv.boostCooldownS = Math.max(0, drv.boostCooldownS - dt);
+    if (drv.boostRemainingS > 0) {
+      drv.boostRemainingS = Math.max(0, drv.boostRemainingS - dt);
+      if (drv.boostRemainingS === 0) {
+        if (drv.ersMode === 'OVERRIDE') drv.ersMode = 'BALANCED';
+        drv.boostCooldownS = 4;
+      }
+    }
+
+    // Rev limiter (fuel cut with 150 rpm hysteresis)
+    if (rpm > VF26_ENGINE.limiterRpm) drv.limiterCut = true;
+    else if (rpm < VF26_ENGINE.limiterRpm - 150) drv.limiterCut = false;
+
+    // Turbo: boost target from the controller LUT, scaled by throttle, with spool lag
+    const boostTarget = drv.limiterCut ? 0 : this.boostLut.evaluate(rpm) * throttle;
+    const tau = boostTarget > drv.boostBar ? VF26_ENGINE.turboSpoolTauS : VF26_ENGINE.turboDecayTauS;
+    drv.boostBar += (boostTarget - drv.boostBar) * (1 - Math.exp(-dt / tau));
+
+    // MGU-K deployment (mod ERS controller curves) / harvesting
+    const { ctrl, override } = this.ersController();
+    const soc = drv.ersEnergyJ / VF26_ERS.batteryJ;
+    const omega = Math.max(drv.engineOmega, 1);
+    const shifting = drv.shiftTimerS > 0;
+    let mgukTorque = 0;
+    let harvestAxle = 0;
+    const kinetic = this.kineticLut.evaluate(rpm);
+
+    if (throttle > 0.02 && brake < 0.05 && drv.clutchLocked && !shifting && drv.ersEnergyJ > 0) {
+      let speedFactor = ctrl.speed.evaluate(speedKmh);
+      if (override) {
+        speedFactor = speedKmh <= 337 ? (speedKmh < 100 ? 0 : 1) : Math.max(0, 1 - (speedKmh - 337) / 18);
+      }
+      const frac = THREE.MathUtils.clamp(
+        THREE.MathUtils.clamp(ctrl.throttle.evaluate(throttle), 0, 1) *
+          speedFactor *
+          THREE.MathUtils.clamp(ctrl.gear.evaluate(drv.gear), 0, 1) *
+          THREE.MathUtils.clamp(ctrl.soc.evaluate(soc), 0, 1),
+        0,
+        1
+      );
+      mgukTorque = Math.min(kinetic * frac, VF26_ERS.maxPowerW / omega);
+      const energy = mgukTorque * omega * dt;
+      if (energy > drv.ersEnergyJ) {
+        mgukTorque = drv.ersEnergyJ / (omega * dt);
+      }
+      drv.ersEnergyJ = Math.max(0, drv.ersEnergyJ - mgukTorque * omega * dt);
+    } else if (drv.clutchLocked && speedKmh > 30 && soc < 1) {
+      // Harvest: brake-by-wire on the rear axle, or lift-off coast harvest
+      let frac = 0;
+      if (brake > 0.02) frac = THREE.MathUtils.clamp(brake / 0.4, 0, 1);
+      else if (throttle < 0.05) frac = ctrl.coastHarvest;
+      if (frac > 0) {
+        const ratio = Math.abs(this.overallRatio(drv.gear));
+        let harvestTorque = Math.min(kinetic, VF26_ERS.maxPowerW / omega) * frac;
+        if (brake <= 0.02 && ratio > 0) {
+          harvestTorque = Math.min(harvestTorque, VF26_ERS.coastHarvestMaxAxleTorqueNm / ratio);
+        }
+        harvestAxle = harvestTorque * ratio;
+        mgukTorque = -harvestTorque;
+        drv.ersEnergyJ = Math.min(
+          VF26_ERS.batteryJ,
+          drv.ersEnergyJ + harvestTorque * omega * dt * VF26_ERS.harvestEfficiency
+        );
+      }
+    }
+    // Braking harvest is delivered at the wheels via BBW, so it is not added to the crank torque path
+    // (the rear hydraulic brakes are reduced by the same amount in outerStep).
+    const brakingHarvest = brake > 0.02 && mgukTorque < 0;
+    drv.mgukTorqueNm = brakingHarvest ? 0 : mgukTorque;
+    drv.harvestAxleTorqueNm = brakingHarvest ? harvestAxle : 0;
+    drv.mgukPowerW = mgukTorque * omega;
+  }
+
+  /** Crank torque from ICE + MGU-K at the given engine speed with the current controls */
+  private engineTorque(omega: number, throttle: number): number {
+    const drv = this.drivetrain;
+    const rpm = omega * RADS2RPM;
+    const coast = this.coastLut.evaluate(rpm);
+    let ice: number;
+    if (drv.limiterCut || drv.shiftTimerS > 0 || drv.fuelKg <= 0) {
+      ice = coast;
+    } else {
+      const full = this.torqueLut.evaluate(rpm) * (1 + drv.boostBar);
+      ice = coast + (full - coast) * throttle;
+    }
+    drv.iceTorqueNm = ice;
+    const mguk = drv.shiftTimerS > 0 ? Math.min(0, drv.mgukTorqueNm) : drv.mgukTorqueNm;
+    return ice + mguk;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Track contact, gravity & aero (outer step)
+  // ---------------------------------------------------------------------------
+
+  private updateRoadContacts(sample: ReturnType<BuiltTrackData['getSampleAtDistance']>, reset: boolean): void {
+    const speed = Math.abs(this.vxMs);
+    for (const w of this.wheels) {
+      const contact = queryWheelGroundContact(this.track, w.worldPos.x, w.worldPos.z, this.sMeters + w.staticPos.x, speed);
+      w.zRoad = contact.zRoad;
+      w.surfaceType = contact.surfaceType;
+      w.surfaceFrictionMult = contact.frictionMult * (sample.gripMultiplier ?? 1);
+      w.surfaceBumpM = contact.bumpM;
+      w.roadOffsetPrev = reset ? contact.zRoad + contact.bumpM - w.worldPos.y : w.roadOffset;
+      w.roadOffset = contact.zRoad + contact.bumpM - w.worldPos.y;
+    }
+  }
+
+  /** Instantaneous cross-slope of the KN5 surface under the car centre (rad) */
+  private measureLocalBank(sample: ReturnType<BuiltTrackData['getSampleAtDistance']>): number {
+    const yLeft = evaluateSampleLateralHeightM(sample, this.lateralOffsetM - 0.8);
+    const yRight = evaluateSampleLateralHeightM(sample, this.lateralOffsetM + 0.8);
+    return Math.atan2(yLeft - yRight, 1.6);
+  }
+
+  /** Road-plane normal under the car (filtered cross-slope; identical frame used for rendering) */
+  private localRoadUp(sample: ReturnType<BuiltTrackData['getSampleAtDistance']>): THREE.Vector3 {
+    const rightFlat = new THREE.Vector3(-sample.tangent.z, 0, sample.tangent.x).normalize();
+    const upFlat = new THREE.Vector3().crossVectors(rightFlat, sample.tangent).normalize();
+    return upFlat.applyAxisAngle(sample.tangent, this.planeBankRad).normalize();
+  }
+
+  private updateGravity(sample: ReturnType<BuiltTrackData['getSampleAtDistance']>): void {
+    const up = this.localRoadUp(sample);
+    const hx = Math.sin(this.worldYawRad);
+    const hz = Math.cos(this.worldYawRad);
+    const fy = Math.abs(up.y) > 1e-4 ? -(hx * up.x + hz * up.z) / up.y : 0;
+    const fwd = new THREE.Vector3(hx, fy, hz).normalize();
+    const right = new THREE.Vector3().crossVectors(fwd, up).normalize();
+    // Gravity (0, −g, 0) expressed in the body frame on the road plane
+    this.gravityBody.x = -G * fwd.y;
+    this.gravityBody.y = G * right.y; // left = −right
+    this.gravityBody.n = G * up.y;
+    const heading = Math.atan2(sample.tangent.x, sample.tangent.z);
+    const rel = Math.cos(this.worldYawRad - heading);
+    this.verticalCurvature = THREE.MathUtils.clamp(sample.verticalCurvature * 2 * rel * rel, -0.03, 0.03);
+  }
+
+  private updateAero(dt: number): void {
+    void dt;
+    const v2 = this.vxMs * this.vxMs + this.vyMs * this.vyMs;
+    const q = 0.5 * this.airDensity * v2;
+    const beta = Math.abs(this.vxMs) > 1 ? Math.atan2(Math.abs(this.vyMs), Math.abs(this.vxMs)) : 0;
+
+    // Road height under an element, interpolated between the axle contact patches
+    const roadF = 0.5 * (this.wheels[0].roadOffset + this.wheels[1].roadOffset);
+    const roadR = 0.5 * (this.wheels[2].roadOffset + this.wheels[3].roadOffset);
+    const a = this.cgToFrontAxleM;
+    const L = this.wheelbaseM;
+
+    let down = 0;
+    let front = 0;
+    let drag = 0;
+    let pitch = 0;
+    let floorGh = 0;
+    let floorCount = 0;
+    for (const wing of this.wings) {
+      const s = wing.spec;
+      const angle = wingAngleDeg(s, this.aeroPreset, this.xModeBlend);
+      const z = s.position[2];
+      const y = s.position[1];
+
+      let ghCl = 1;
+      let ghCd = 1;
+      if (wing.ghCl || wing.ghCd) {
+        const frac = THREE.MathUtils.clamp((a - z) / L, -0.3, 1.3);
+        const road = roadF + (roadR - roadF) * frac;
+        const bodyZ = this.heaveM + z * this.pitchRad;
+        const hgt = Math.max(0, this.cgHeightM + y + bodyZ - road);
+        if (wing.ghCl) ghCl = wing.ghCl.evaluate(hgt);
+        if (wing.ghCd) ghCd = wing.ghCd.evaluate(hgt);
+        if (s.name.startsWith('FLOOR')) {
+          floorGh += ghCl;
+          floorCount++;
+        }
+      }
+      const yawMult = Math.max(0, 1 + s.yawClGain * beta);
+      const cl = wing.aoaCl.evaluate(angle) * s.clGain * ghCl * yawMult;
+      const cd = wing.aoaCd.evaluate(angle) * s.cdGain * ghCd;
+      const fDown = q * wing.area * cl;
+      const fDrag = q * wing.area * cd;
+      down += fDown;
+      front += fDown * THREE.MathUtils.clamp((z + this.cgToRearAxleM) / L, -0.5, 1.5);
+      drag += fDrag;
+      pitch += -fDown * z + fDrag * y;
+    }
+    this.aeroDownforceN = down;
+    this.aeroFrontDownforceN = front;
+    this.aeroRearDownforceN = down - front;
+    this.aeroDragN = drag;
+    this.aeroPitchMomentNm = pitch;
+    // Side force from the body/fin side area (Cy·A ≈ 1.6 m², centre of pressure 0.45 m behind CG)
+    this.aeroSideCoef = 0.5 * this.airDensity * 1.6;
+    this.groundEffectFactor = floorCount > 0 ? floorGh / floorCount : 1;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2 kHz sub-step
+  // ---------------------------------------------------------------------------
+
+  private subStep(h: number, throttle: number, roadFrac: number, outerDt: number): { ax: number; ay: number } {
+    void outerDt;
+    const M = this.totalMassKg;
+    const r = -this.yawRateRadS; // CCW yaw rate
+    const drv = this.drivetrain;
+
+    let sumFx = 0;
+    let sumFy = 0;
+    let sumMz = 0;
+    let fyFront = 0;
+    let fyRear = 0;
+    let fxTyres = 0;
+    const roadTorque: [number, number, number, number] = [0, 0, 0, 0];
+
+    // ---- Tyre forces ----
+    for (const w of this.wheels) {
+      const axle = w.isFront ? this.axles[0] : this.axles[1];
+      const vbx = this.vxMs - r * w.staticPos.y;
+      const vby = this.vyMs + r * w.staticPos.x;
+      const cs = Math.cos(w.steerRad);
+      const sn = Math.sin(w.steerRad);
+      const vxw = vbx * cs + vby * sn;
+      const vyw = -vbx * sn + vby * cs;
+      const radius = w.tyre.spec.radius;
+
+      // Normal load from the radial tyre spring/damper on the unsprung mass
+      const road = THREE.MathUtils.lerp(w.roadOffsetPrev, w.roadOffset, roadFrac);
+      const roadVel = THREE.MathUtils.clamp((w.roadOffset - w.roadOffsetPrev) / F1Physics2026.FIXED_DT, -2, 2);
+      const staticDefl = axle.staticTyreLoad / axle.tyreRate;
+      const defl = road - w.hubZ + staticDefl;
+      const fz = Math.max(0, axle.tyreRate * defl + axle.tyreDamp * (roadVel - w.hubZVel));
+      w.fzN = defl > 0 ? fz : 0;
+
+      // Camber relative to the road (body roll + bump camber)
+      const sideSign = w.isLeft ? 1 : -1;
+      const staticCamber = axle.spec.staticCamberDeg * DEG2RAD;
+      const bumpCamber = axle.spec.camberGainDegPerM * DEG2RAD * w.suspCompression;
+      w.camberLeftRad = sideSign * (staticCamber + bumpCamber) - this.rollRad;
+
+      const out = computeTyreForces(w.tyre, {
+        fz: w.fzN,
+        vx: vxw,
+        vy: vyw,
+        rimSpeed: w.spinVel * radius,
+        camberLeftRad: w.camberLeftRad,
+        surfaceGrip: w.surfaceFrictionMult,
+        dt: h,
+      });
+      w.ftN = out.fx;
+      w.fnN = out.fy;
+      w.slipRatio = out.slipRatio;
+      w.slipAngleRad = out.slipAngle;
+      w.combinedSlipNorm = out.normSlip;
+      w.effectiveMu = out.mu;
+      w.gripFactor = out.gripFactor;
+      w.torqueAlignNm = out.mz;
+
+      const fbx = out.fx * cs - out.fy * sn;
+      const fby = out.fx * sn + out.fy * cs;
+      sumFx += fbx;
+      sumFy += fby;
+      sumMz += w.staticPos.x * fby - w.staticPos.y * fbx + out.mz;
+      fxTyres += fbx;
+      if (w.isFront) fyFront += fby;
+      else fyRear += fby;
+
+      // Rolling resistance acts on the wheel; surfaces like grass add drag
+      const rrMult = w.surfaceType === 'grass' ? 4 : w.surfaceType === 'runoff' ? 2 : 1;
+      const rr = w.tyre.spec.rollingResistance * rrMult * w.fzN * radius;
+      roadTorque[w.index] = out.fx * radius + (Math.abs(w.spinVel) > 0.05 ? Math.sign(w.spinVel) * rr : 0);
+    }
+
+    // ---- Wheel spin: free-rolling fronts ----
+    for (let i = 0; i < 2; i++) {
+      const w = this.wheels[i];
+      const I = w.tyre.spec.angularInertia;
+      const free = w.spinVel - (roadTorque[i] / I) * h;
+      w.spinVel = this.applyBrakeFriction(free, (w.brakeTorqueNm / I) * h);
+    }
+
+    // ---- Rear axle: clutch, gearbox, LSD, engine ----
+    this.integrateDrivenAxle(h, throttle, roadTorque[3], roadTorque[2]);
+
+    for (const w of this.wheels) {
+      w.rotationRad = (w.rotationRad + w.spinVel * h) % (Math.PI * 2000);
+    }
+
+    // ---- Aero, gravity & chassis planar integration ----
+    const speed = Math.hypot(this.vxMs, this.vyMs);
+    if (speed > 0.1) {
+      sumFx -= (this.aeroDragN * this.vxMs) / speed;
+      const side = -this.aeroSideCoef * this.vyMs * speed;
+      sumFy += side;
+      sumMz += -0.45 * side;
+    }
+    sumFx += M * this.gravityBody.x;
+    sumFy += M * this.gravityBody.y;
+
+    // Plank / skid-block contact drag
+    for (const w of this.wheels) {
+      if (w.rideHeight < 0.003) {
+        const pen = 0.003 - w.rideHeight;
+        const nForce = 2.5e6 * pen;
+        sumFx -= 0.45 * nForce * Math.sign(this.vxMs);
+      }
+    }
+
+    const ax = sumFx / M;
+    const ay = sumFy / M;
+    this.vxMs += (ax + r * this.vyMs) * h;
+    this.vyMs += (ay - r * this.vxMs) * h;
+    const rNew = r + (sumMz / this.yawInertiaKgM2) * h;
+    this.yawRateRadS = -rNew;
+
+    this.lastFyFront = fyFront;
+    this.lastFyRear = fyRear;
+    this.lastFxTyres = fxTyres;
+
+    // ---- Vertical dynamics ----
+    this.integrateVertical(h, roadFrac, ax, fyFront, fyRear, false);
+
+    // ---- World pose ----
+    this.worldYawRad = Math.atan2(Math.sin(this.worldYawRad + rNew * h), Math.cos(this.worldYawRad + rNew * h));
+    const sinYaw = Math.sin(this.worldYawRad);
+    const cosYaw = Math.cos(this.worldYawRad);
+    this.worldX += (this.vxMs * sinYaw + this.vyMs * cosYaw) * h;
+    this.worldZ += (this.vxMs * cosYaw - this.vyMs * sinYaw) * h;
+
+    return { ax, ay };
+  }
+
+  /** Coulomb brake friction that can stop, but never reverse, a wheel within one step */
+  private applyBrakeFriction(omega: number, impulse: number): number {
+    if (impulse <= 0) return omega;
+    if (Math.abs(omega) <= impulse) return 0;
+    return omega - Math.sign(omega) * impulse;
+  }
+
+  private integrateDrivenAxle(h: number, throttle: number, roadTqLeft: number, roadTqRight: number): void {
+    const drv = this.drivetrain;
+    const wl = this.wheels[3];
+    const wr = this.wheels[2];
+    const Iw = wl.tyre.spec.angularInertia;
+    const ratio = this.overallRatio(drv.gear);
+    const eta = VF26_DRIVETRAIN.efficiency;
+    const Ie = VF26_ENGINE.inertia;
+    const Igb = VF26_DRIVETRAIN.gearboxInertia;
+    const idle = VF26_ENGINE.idleRpm * RPM2RADS;
+    const maxOmega = VF26_ENGINE.maxRpm * RPM2RADS;
+
+    let omegaAxle = 0.5 * (wl.spinVel + wr.spinVel);
+    let deltaOmega = wl.spinVel - wr.spinVel;
+    const brakeL = wl.brakeTorqueNm;
+    const brakeR = wr.brakeTorqueNm;
+
+    const tEngine = this.engineTorque(drv.engineOmega, throttle);
+    let tIn: number; // torque delivered into the differential
+
+    if (drv.clutchLocked) {
+      // Brake-by-wire MGU-K harvest acts on the rear axle through the gearbox (the rear
+      // hydraulic brake torque was reduced by the same amount in outerStep)
+      tIn = ratio * tEngine * (tEngine >= 0 ? eta : 1 / eta) - drv.harvestAxleTorqueNm;
+      const J = 2 * Iw + (Ie + Igb) * ratio * ratio;
+      const free = omegaAxle + ((tIn - roadTqLeft - roadTqRight) / J) * h;
+      omegaAxle = this.applyBrakeFriction(free, ((brakeL + brakeR) / J) * h);
+      drv.engineOmega = Math.min(maxOmega, omegaAxle * ratio);
+
+      // Auto-clutch opens when the engine would drop below the launch window (anti-stall)
+      if (drv.engineOmega < VF26_DRIVETRAIN.autoClutchStartRpm * RPM2RADS || ratio === 0) {
+        drv.clutchLocked = false;
+        drv.engineOmega = Math.max(idle, drv.engineOmega);
+      }
+    } else {
+      // Launch / anti-stall clutch: engagement follows engine speed (mod: 4000 → 5500 rpm). With the
+      // pedal down the window moves up to the launch rpm, so the engine revs up and the clutch slips
+      // there instead of bogging the engine at idle.
+      const rpm = drv.engineOmega * RADS2RPM;
+      const window = VF26_DRIVETRAIN.autoClutchFullRpm - VF26_DRIVETRAIN.autoClutchStartRpm;
+      const launch = THREE.MathUtils.clamp((drv.launchPedal - 0.2) / 0.6, 0, 1);
+      const startRpm =
+        VF26_DRIVETRAIN.autoClutchStartRpm +
+        launch * Math.max(0, VF26_DRIVETRAIN.launchRpm - window - VF26_DRIVETRAIN.autoClutchStartRpm);
+      const engage = THREE.MathUtils.clamp((rpm - startRpm) / window, 0, 1);
+      drv.clutchEngagement = engage * engage * (3 - 2 * engage);
+      const slip = drv.engineOmega - omegaAxle * ratio;
+      const capacity = drv.clutchEngagement * VF26_DRIVETRAIN.clutchMaxTorqueNm;
+      const tClutch = ratio !== 0 ? THREE.MathUtils.clamp(slip * 40, -capacity, capacity) : 0;
+
+      drv.engineOmega += ((tEngine - tClutch) / (Ie + 0.002)) * h;
+      if (drv.engineOmega < idle) drv.engineOmega = idle; // idle governor
+      if (drv.engineOmega > maxOmega) drv.engineOmega = maxOmega;
+
+      tIn = ratio * tClutch * eta;
+      const J = 2 * Iw + Igb * ratio * ratio;
+      const free = omegaAxle + ((tIn - roadTqLeft - roadTqRight) / J) * h;
+      omegaAxle = this.applyBrakeFriction(free, ((brakeL + brakeR) / J) * h);
+
+      const slipAfter = drv.engineOmega - omegaAxle * ratio;
+      if (ratio !== 0 && Math.abs(slipAfter) < 8 && capacity >= Math.abs(tEngine) * 0.9 && capacity > 50) {
+        drv.clutchLocked = true;
+        drv.engineOmega = omegaAxle * ratio;
+      }
+    }
+
+    // Limited-slip differential (preload + power/coast ramp locking)
+    const lock = tIn >= 0 ? VF26_DRIVETRAIN.diffPowerLock : VF26_DRIVETRAIN.diffCoastLock;
+    const capacity = VF26_DRIVETRAIN.diffPreloadNm + lock * Math.abs(tIn);
+    const sgn = (v: number) => (Math.abs(v) > 0.05 ? Math.sign(v) : 0);
+    const dRoad = roadTqLeft + brakeL * sgn(wl.spinVel) - (roadTqRight + brakeR * sgn(wr.spinVel));
+    const tReq = (Iw * deltaOmega) / h * 0.5 - dRoad * 0.5;
+    if (Math.abs(tReq) <= capacity) {
+      deltaOmega = 0;
+      drv.diffLockedFraction = 1;
+    } else {
+      const tLsd = Math.sign(tReq) * capacity;
+      deltaOmega += ((-2 * tLsd - dRoad) / Iw) * h;
+      drv.diffLockedFraction = 0;
+    }
+
+    wl.spinVel = omegaAxle + deltaOmega * 0.5;
+    wr.spinVel = omegaAxle - deltaOmega * 0.5;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Suspension: sprung heave / pitch / roll + 4 unsprung hubs
+  // ---------------------------------------------------------------------------
+
+  private integrateVertical(h: number, roadFrac: number, axBody: number, fyFront: number, fyRear: number, settling: boolean): void {
+    const ms = this.sprungMassKg;
+    const M = this.totalMassKg;
+    const gExtra = this.gravityBody.n - G + this.vxMs * this.vxMs * this.verticalCurvature;
+    const sprungShare = ms / M;
+    const hcg = this.cgHeightM;
+
+    const dF: [number, number, number, number] = [0, 0, 0, 0];
+    const comp: [number, number, number, number] = [0, 0, 0, 0];
+    const compVel: [number, number, number, number] = [0, 0, 0, 0];
+
+    for (const w of this.wheels) {
+      const zc = this.heaveM + w.staticPos.x * this.pitchRad + w.staticPos.y * this.rollRad;
+      const zcVel = this.heaveVelMs + w.staticPos.x * this.pitchVelRadS + w.staticPos.y * this.rollVelRadS;
+      const c = w.hubZ - zc;
+      const cv = w.hubZVel - zcVel;
+      comp[w.index] = c;
+      compVel[w.index] = cv;
+      w.suspCompression = c;
+      w.suspCompressionVel = cv;
+
+      const axle = w.isFront ? this.axles[0] : this.axles[1];
+      const sp = axle.spec;
+      const x0 = axle.staticSpringDeflection;
+      let f = sp.springRate * c + 0.5 * sp.progressiveRate * ((x0 + c) * Math.abs(x0 + c) - x0 * x0);
+      // Two-stage dampers
+      const d = sp.damper;
+      if (cv >= 0) {
+        f += cv <= d.bumpThreshold ? d.bumpSlow * cv : d.bumpSlow * d.bumpThreshold + d.bumpFast * (cv - d.bumpThreshold);
+      } else {
+        const a = -cv;
+        f -= a <= d.reboundThreshold ? d.reboundSlow * a : d.reboundSlow * d.reboundThreshold + d.reboundFast * (a - d.reboundThreshold);
+      }
+      // Bump rubber
+      if (c > sp.bumpStopTravel) {
+        const pen = c - sp.bumpStopTravel;
+        f += sp.bumpStopRate * pen + 6e7 * pen * pen;
+      }
+      // Droop limiter (strap)
+      if (c < -sp.droopTravel) {
+        f += 1.2e6 * (c + sp.droopTravel) + 4000 * Math.min(0, cv);
+      }
+      dF[w.index] = f;
+    }
+
+    // Anti-roll bars and heave (third) elements
+    for (let ax = 0; ax < 2; ax++) {
+      const axle = this.axles[ax];
+      const sp = axle.spec;
+      const iR = ax * 2;
+      const iL = ax * 2 + 1;
+      const fArb = sp.arbRate * (comp[iL] - comp[iR]);
+      dF[iL] += fArb;
+      dF[iR] -= fArb;
+
+      const cAvg = 0.5 * (comp[iL] + comp[iR]);
+      const cAvgVel = 0.5 * (compVel[iL] + compVel[iR]);
+      let fHeave = sp.heaveDamping * cAvgVel;
+      if (cAvg > 0) {
+        fHeave += sp.heaveRate * cAvg + 0.5 * sp.heaveProgressiveRate * cAvg * cAvg;
+        if (cAvg > sp.heavePackerTravel) {
+          const pen = cAvg - sp.heavePackerTravel;
+          fHeave += sp.heavePackerRate * pen + 4e7 * pen * pen;
+        }
+      }
+      dF[iL] += 0.5 * fHeave;
+      dF[iR] += 0.5 * fHeave;
+    }
+
+    // Floor plank contact supports the body if it bottoms out
+    const plank: [number, number, number, number] = [0, 0, 0, 0];
+    for (const w of this.wheels) {
+      const axle = w.isFront ? this.axles[0] : this.axles[1];
+      const zc = this.heaveM + w.staticPos.x * this.pitchRad + w.staticPos.y * this.rollRad;
+      const road = THREE.MathUtils.lerp(w.roadOffsetPrev, w.roadOffset, roadFrac);
+      w.rideHeight = axle.spec.staticRideHeight + zc - road;
+      if (w.rideHeight < 0.003) {
+        const zcVel = this.heaveVelMs + w.staticPos.x * this.pitchVelRadS + w.staticPos.y * this.rollVelRadS;
+        plank[w.index] = 2.5e6 * (0.003 - w.rideHeight) - 6000 * Math.min(0, zcVel);
+      }
+    }
+
+    // Sprung body
+    let fz = -this.aeroDownforceN - ms * gExtra;
+    let mPitch = this.aeroPitchMomentNm + (settling ? 0 : this.lastFxTyres * sprungShare * hcg);
+    let mRoll =
+      settling ? 0 : (fyFront * (hcg - this.axles[0].rollCentreHeight) + fyRear * (hcg - this.axles[1].rollCentreHeight)) * sprungShare;
+    for (const w of this.wheels) {
+      const f = dF[w.index] + plank[w.index];
+      fz += f;
+      mPitch += f * w.staticPos.x;
+      mRoll += f * w.staticPos.y;
+    }
+    void axBody;
+
+    this.heaveVelMs += (fz / ms) * h;
+    this.pitchVelRadS += (mPitch / this.pitchInertiaKgM2) * h;
+    this.rollVelRadS += (mRoll / this.rollInertiaKgM2) * h;
+    this.heaveM += this.heaveVelMs * h;
+    this.pitchRad += this.pitchVelRadS * h;
+    this.rollRad += this.rollVelRadS * h;
+
+    // Unsprung hubs (geometric roll-centre load transfer acts directly through the links)
+    for (const w of this.wheels) {
+      const axle = w.isFront ? this.axles[0] : this.axles[1];
+      const road = THREE.MathUtils.lerp(w.roadOffsetPrev, w.roadOffset, roadFrac);
+      const roadVel = THREE.MathUtils.clamp((w.roadOffset - w.roadOffsetPrev) / F1Physics2026.FIXED_DT, -2, 2);
+      const staticDefl = axle.staticTyreLoad / axle.tyreRate;
+      const defl = road - w.hubZ + staticDefl;
+      const ft = defl > 0 ? Math.max(0, axle.tyreRate * defl + axle.tyreDamp * (roadVel - w.hubZVel)) : 0;
+      const fyAxle = settling ? 0 : w.isFront ? fyFront : fyRear;
+      const fGeo = (fyAxle * axle.rollCentreHeight) / axle.spec.track;
+      const geo = w.isLeft ? -fGeo : fGeo;
+      const mu = axle.spec.unsprungMassKg;
+      const acc = (ft - axle.staticTyreLoad - dF[w.index] - geo) / mu - gExtra;
+      w.hubZVel += acc * h;
+      w.hubZ += w.hubZVel * h;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Track projection, barriers, timing
+  // ---------------------------------------------------------------------------
+
+  private postIntegrate(prevS: number): void {
+    const projected = this.track.projectWorldToTrack(this.worldX, this.worldZ, prevS);
+    const nextSample = projected.sample;
+    this.sMeters = projected.s;
+    this.lateralOffsetM = projected.lateralOffset;
+
+    const trackHeadingRad = Math.atan2(nextSample.tangent.x, nextSample.tangent.z);
+    let headingErr = trackHeadingRad - this.worldYawRad;
+    while (headingErr > Math.PI) headingErr -= Math.PI * 2;
+    while (headingErr < -Math.PI) headingErr += Math.PI * 2;
+    this.headingErrorRad = headingErr;
+
+    // Tyre barriers at the edge of the run-off: inelastic impact with wall friction
+    const maxWallOffset = nextSample.width * 0.5 + 4.8;
+    if (Math.abs(this.lateralOffsetM) > maxWallOffset) {
+      const side = Math.sign(this.lateralOffsetM);
+      const bx = nextSample.binormal.x;
+      const bz = nextSample.binormal.z;
+      const bLen = Math.hypot(bx, bz) || 1;
+      const nx = (-side * bx) / bLen; // normal pointing back toward the track
+      const nz = (-side * bz) / bLen;
+      const sinYaw = Math.sin(this.worldYawRad);
+      const cosYaw = Math.cos(this.worldYawRad);
+      let vwx = this.vxMs * sinYaw + this.vyMs * cosYaw;
+      let vwz = this.vxMs * cosYaw - this.vyMs * sinYaw;
+      const vn = vwx * nx + vwz * nz;
+      if (vn < 0) {
+        const restitution = 0.25;
+        const dvn = -(1 + restitution) * vn;
+        vwx += dvn * nx;
+        vwz += dvn * nz;
+        // Wall friction scrubs tangential speed
+        const tx = -nz;
+        const tz = nx;
+        const vt = vwx * tx + vwz * tz;
+        const scrub = Math.min(Math.abs(vt), 0.5 * dvn);
+        vwx -= Math.sign(vt) * scrub * tx;
+        vwz -= Math.sign(vt) * scrub * tz;
+        this.yawRateRadS *= 0.6;
+      }
+      this.vxMs = vwx * sinYaw + vwz * cosYaw;
+      this.vyMs = vwx * cosYaw - vwz * sinYaw;
+      this.lateralOffsetM = side * maxWallOffset;
+      this.worldX = nextSample.position.x + nextSample.binormal.x * this.lateralOffsetM;
+      this.worldZ = nextSample.position.z + nextSample.binormal.z * this.lateralOffsetM;
+    }
+
+    this.lastSyncedSMeters = this.sMeters;
+    this.lastSyncedLateralOffsetM = this.lateralOffsetM;
+    this.lastSyncedHeadingErrorRad = this.headingErrorRad;
+
+    if (nextSample.sector !== this.lastSector) {
+      this.onSectorCompleted(this.lastSector);
+      this.lastSector = nextSample.sector;
+    }
+    if (prevS > this.track.totalLengthM * 0.85 && this.sMeters < this.track.totalLengthM * 0.15) {
+      this.onLapCompleted();
+    }
+  }
+
+  /** Computes the world positions of the 4 contact points on the local road plane */
+  private updateWheelWorldPositions(sample: ReturnType<BuiltTrackData['getSampleAtDistance']>): void {
+    const carGroundY = evaluateSampleLateralHeightM(sample, this.lateralOffsetM);
+    const carUp = this.localRoadUp(sample);
+    const hx = Math.sin(this.worldYawRad);
+    const hz = Math.cos(this.worldYawRad);
+    const fy = Math.abs(carUp.y) > 1e-4 ? -(hx * carUp.x + hz * carUp.z) / carUp.y : 0;
+    const fLen = Math.hypot(hx, fy, hz);
+    const fx = hx / fLen;
+    const fyN = fy / fLen;
+    const fz = hz / fLen;
+    // right = forward × up
+    let rx = fyN * carUp.z - fz * carUp.y;
+    let ry = fz * carUp.x - fx * carUp.z;
+    let rz = fx * carUp.y - fyN * carUp.x;
+    const rLen = Math.hypot(rx, ry, rz) || 1;
+    rx /= rLen;
+    ry /= rLen;
+    rz /= rLen;
+    for (const w of this.wheels) {
+      w.worldPos.x = this.worldX + fx * w.staticPos.x - rx * w.staticPos.y;
+      w.worldPos.y = carGroundY + fyN * w.staticPos.x - ry * w.staticPos.y;
+      w.worldPos.z = this.worldZ + fz * w.staticPos.x - rz * w.staticPos.y;
+    }
+  }
+
+  /** Target-speed profile for the AI, rebuilt when the aero package changes */
+  private getAiPlan(): { profile: SpeedProfile; params: AiVehicleParams } {
+    if (!this.aiProfile || this.aiProfile.preset !== this.aeroPreset) {
+      const car = createVf26ProfileCarModel(this.aeroPreset);
+      this.aiProfile = {
+        preset: this.aeroPreset,
+        profile: computeSpeedProfile(this.track.samples, car),
+        params: {
+          wheelbaseM: this.wheelbaseM,
+          maxSteerLockRad: this.maxSteerAngleRad,
+          car,
+          fullBrakeForceN: vf26FullBrakeForceN(),
+          aeroTransitionS: VF26_ACTIVE_AERO_TRANSITION_S,
+        },
+      };
+    }
+    return this.aiProfile;
+  }
+
+  private buildObservation(sample: ReturnType<BuiltTrackData['getSampleAtDistance']>): AssettoCorsaGymObservation {
+    const { lookaheadCurvatures, lookaheadTargetSpeedsMs } = computeLookaheadVectors(this.track, this.sMeters);
+    const racelineOffsetM = aiLineOffsetM(sample);
+    const gapToRacingLineM = this.lateralOffsetM - racelineOffsetM;
+    let wheelsOut = 0;
+    for (const w of this.wheels) {
+      if (w.surfaceType === 'runoff' || w.surfaceType === 'grass') wheelsOut++;
+    }
+    const W = this.wheels;
+    return {
+      speedMs: this.vxMs,
+      localVelocityX: this.vxMs,
+      localVelocityY: this.vyMs,
+      localVelocityZ: this.vzMs,
+      angularVelocityX: this.rollVelRadS,
+      angularVelocityY: this.pitchVelRadS,
+      angularVelocityZ: -this.yawRateRadS,
+      accelX: this.lastAxMs2,
+      accelY: this.lastAyMs2,
+      rollRad: this.rollRad,
+      pitchRad: this.pitchRad,
+      yawRad: this.worldYawRad,
+      engineRpm: this.rpm,
+      gear: this.gear,
+      normalizedSplinePosition: this.sMeters / this.track.totalLengthM,
+      gapToRacingLineM,
+      lateralOffsetCenterM: this.lateralOffsetM,
+      headingErrorRad: this.headingErrorRad,
+      slipAngleRad: [W[0].slipAngleRad, W[1].slipAngleRad, W[2].slipAngleRad, W[3].slipAngleRad],
+      slipRatio: [W[0].slipRatio, W[1].slipRatio, W[2].slipRatio, W[3].slipRatio],
+      tyreLoadN: [W[0].fzN, W[1].fzN, W[2].fzN, W[3].fzN],
+      rideHeightM: [W[0].rideHeight, W[1].rideHeight, W[2].rideHeight, W[3].rideHeight],
+      tyreTempC: [W[0].tyre.surfaceTempC, W[1].tyre.surfaceTempC, W[2].tyre.surfaceTempC, W[3].tyre.surfaceTempC],
+      lookaheadCurvatures,
+      lookaheadTargetSpeedsMs,
+      wheelsOutOfTrack: wheelsOut,
+      outOfTrack: wheelsOut >= 3,
+    };
+  }
+
+  // ===========================================================================
+  // Telemetry
+  // ===========================================================================
+
   private createInitialTelemetry(): CarTelemetry {
     return {
       speedKmh: 0,
       speedMs: 0,
-      rpm: 4200,
+      rpm: VF26_ENGINE.idleRpm,
       gear: 1,
       throttle: 0,
       brake: 0,
-      clutch: 1,
+      clutch: 0,
       steering: 0,
       longitudinalG: 0,
       lateralG: 0,
       verticalG: 1,
       altitudeM: BASE_ALTITUDE_M + 35,
       trackElevationM: 35,
-      airDensityKgM3: 1.041,
+      airDensityKgM3: 1.06,
       activeAeroMode: 'Z_MODE',
       autoXMode: true,
       downforceN: 0,
@@ -268,17 +1693,17 @@ export class F1Physics2026 {
       manualOverrideActive: false,
       boostRemainingS: 0,
       turboBoostBar: 1.0,
-      fuelKg: this.config.initialFuelKg,
+      fuelKg: VF26_CHASSIS.fuelKg,
       tireSlipRatio: [0, 0, 0, 0],
       wheelSlipRatios: [0, 0, 0, 0],
       wheelSlipAnglesDeg: [0, 0, 0, 0],
-      wheelLoadsN: [1800, 1800, 2150, 2150],
-      wheelRideHeightsMm: [32, 32, 46, 46],
-      suspensionTravelMm: [18, 18, 24, 24],
-      tireTempsC: [92, 92, 94, 94],
+      wheelLoadsN: [0, 0, 0, 0],
+      wheelRideHeightsMm: [44, 44, 60, 60],
+      suspensionTravelMm: [0, 0, 0, 0],
+      tireTempsC: [INITIAL_TYRE_TEMP_C, INITIAL_TYRE_TEMP_C, INITIAL_TYRE_TEMP_C, INITIAL_TYRE_TEMP_C],
       tireWearPct: [0, 0, 0, 0],
       tireGripFactor: [1, 1, 1, 1],
-      brakeTempsC: [320, 320, 300, 300],
+      brakeTempsC: [INITIAL_BRAKE_TEMP_C, INITIAL_BRAKE_TEMP_C, INITIAL_BRAKE_TEMP_C, INITIAL_BRAKE_TEMP_C],
       wheelSurfaces: ['asphalt', 'asphalt', 'asphalt', 'asphalt'],
       frontSlipAngleDeg: 0,
       rearSlipAngleDeg: 0,
@@ -289,7 +1714,7 @@ export class F1Physics2026 {
       offTrack: false,
       surface: 'asphalt',
       trackDistanceM: 35,
-      trackProgress: 35 / TRACK_TOTAL_LENGTH_M,
+      trackProgress: 35 / this.track.totalLengthM,
       lateralOffsetM: 0,
       gapToRacingLineM: 0,
       headingErrorRad: 0,
@@ -313,1151 +1738,123 @@ export class F1Physics2026 {
     };
   }
 
-  public resetToStartGrid(flyingStart = false): void {
-    this.timeAccumulator = 0;
-    this.sMeters = flyingStart ? 50 : 35;
-    const sample = this.track.getSampleAtDistance(this.sMeters);
-    this.lateralOffsetM = 0;
-    this.headingErrorRad = 0;
-    this.yawRateRadS = 0;
-    this.vxMs = flyingStart ? 75.0 : 0;
-    this.vyMs = 0;
-    this.vzMs = 0;
-    this.lastAxMs2 = 0;
-    this.lastAyMs2 = 0;
-    this.steerAngleNorm = 0;
-    this.frontWheelAngleRad = 0;
-    this.ffbTorqueNorm = 0;
-    this.rawSteerFiltered = 0;
-    this.pitchRad = 0;
-    this.rollRad = 0;
-    this.pitchVelRadS = 0;
-    this.rollVelRadS = 0;
-    this.rideHeightOffsetM = 0;
-
-    this.gear = flyingStart ? 7 : 1;
-    this.rpm = flyingStart ? 11200 : 4200;
-    this.ersEnergyJ = this.maxErsEnergyJ;
-    this.activeAeroMode = flyingStart ? 'X_MODE' : 'Z_MODE';
-
-    // Reset drivetrain & wheel spin velocities to match initial road speed
-    this.drivetrain = initDrivetrainState(this.config);
-    this.drivetrain.gearbox.gear = this.gear;
-    this.drivetrain.gearbox.gearNext = this.gear;
-    this.drivetrain.engine.rpm = this.rpm;
-    this.drivetrain.engine.rads = (this.rpm * 2 * Math.PI) / 60;
-    this.drivetrain.engine.ersEnergyJ = this.ersEnergyJ;
-
-    for (let i = 0; i < 4; i++) {
-      const wCfg = this.config.wheels[i];
-      this.wheels[i] = initWheelState(
-        i as WheelCornerIndex,
-        wCfg,
-        0,
-        0,
-        this.tireCompound
-      );
-      this.wheels[i].spinVel = this.vxMs / wCfg.radius;
-      this.wheels[i].preSpinVel = this.wheels[i].spinVel;
-    }
-
-    this.simTimeMs = 0;
-    this.currentLapStartMs = 0;
-    this.currentSectorStartMs = 0;
-    this.lastSector = sample.sector;
-
-    this.syncCartesianFromCurvilinear();
-    this.syncWorldTransform();
-    this.updateWheelWorldPositions(sample);
-    this.lastObservation = this.buildObservation(sample);
-    this.updateTelemetrySnapshot(sample, {
-      throttle: 0,
-      brake: 0,
-      steerLeft: 0,
-      steerRight: 0,
-      manualOverride: false,
-      toggleXMode: false,
-      shiftUp: false,
-      shiftDown: false,
-    });
-  }
-
-  public teleportToDistance(sMeters: number, speedMs = 0): void {
-    const wrapped =
-      ((sMeters % TRACK_TOTAL_LENGTH_M) + TRACK_TOTAL_LENGTH_M) %
-      TRACK_TOTAL_LENGTH_M;
-    const sample = this.track.getSampleAtDistance(wrapped);
-    this.timeAccumulator = 0;
-    this.sMeters = wrapped;
-    this.lateralOffsetM = 0;
-    this.headingErrorRad = 0;
-    this.yawRateRadS = 0;
-    this.vxMs = Math.max(0, speedMs);
-    this.vyMs = 0;
-    this.vzMs = 0;
-    this.lastAxMs2 = 0;
-    this.lastAyMs2 = 0;
-    this.steerAngleNorm = 0;
-    this.frontWheelAngleRad = 0;
-    this.rawSteerFiltered = 0;
-    this.pitchRad = 0;
-    this.rollRad = 0;
-    this.gear =
-      speedMs > 1
-        ? Math.max(1, Math.min(8, Math.ceil((speedMs * 3.6) / 42)))
-        : 1;
-    this.rpm = speedMs > 1 ? 10500 : 4200;
-    this.drivetrain.gearbox.gear = this.gear;
-    this.drivetrain.gearbox.gearNext = this.gear;
-    this.drivetrain.engine.rpm = this.rpm;
-    this.drivetrain.engine.rads = (this.rpm * 2 * Math.PI) / 60;
-
-    for (let i = 0; i < 4; i++) {
-      this.wheels[i].spinVel = this.vxMs / this.config.wheels[i].radius;
-      this.wheels[i].preSpinVel = this.wheels[i].spinVel;
-      this.wheels[i].slipRatio = 0;
-      this.wheels[i].slipAngleRad = 0;
-    }
-
-    this.lastSector = sample.sector;
-    this.syncCartesianFromCurvilinear();
-    this.syncWorldTransform();
-    this.updateWheelWorldPositions(sample);
-    this.lastObservation = this.buildObservation(sample);
-    this.updateTelemetrySnapshot(sample, {
-      throttle: 0,
-      brake: 0,
-      steerLeft: 0,
-      steerRight: 0,
-      manualOverride: false,
-      toggleXMode: false,
-      shiftUp: false,
-      shiftDown: false,
-    });
-  }
-
-  public teleportToTurn(turnNumber: number): void {
-    const idx = this.track.samples.findIndex((s) => s.turnNumber === turnNumber);
-    const targetSample =
-      idx >= 0
-        ? this.track.samples[(idx + 2) % this.track.samples.length]
-        : this.track.samples[0];
-
-    const speedMs = Math.min(62, targetSample.optimalSpeedKmh / 3.6);
-    this.teleportToDistance(targetSample.s, speedMs);
-    this.lateralOffsetM =
-      targetSample.racingLineOffset * (targetSample.width * 0.28);
-    this.syncCartesianFromCurvilinear();
-    this.syncWorldTransform();
-  }
-
-  private syncCartesianFromCurvilinear(): void {
-    const sample = this.track.getSampleAtDistance(this.sMeters);
-    this.worldX = sample.position.x + sample.binormal.x * this.lateralOffsetM;
-    this.worldZ = sample.position.z + sample.binormal.z * this.lateralOffsetM;
-    const trackHeadingRad = Math.atan2(sample.tangent.x, sample.tangent.z);
-    this.worldYawRad = Math.atan2(
-      Math.sin(trackHeadingRad - this.headingErrorRad),
-      Math.cos(trackHeadingRad - this.headingErrorRad)
-    );
-    this.lastSyncedSMeters = this.sMeters;
-    this.lastSyncedLateralOffsetM = this.lateralOffsetM;
-    this.lastSyncedHeadingErrorRad = this.headingErrorRad;
-  }
-
-  private computeAirDensity(altitudeM: number): number {
-    return 1.225 * Math.pow(1 - 2.25577e-5 * altitudeM, 4.25588);
-  }
-
-  /**
-   * Main frame entry point. Accumulates frame delta time and steps the physics solver
-   * at a strict fixed timestep of `dt = 0.002s` (500 Hz), completely decoupled from render FPS.
-   */
-  public step(dtSeconds: number, rawInputs: Partial<ControlInputs>): CarTelemetry {
-    if (!Number.isFinite(dtSeconds) || dtSeconds <= 0) {
-      return this.telemetry;
-    }
-
-    // If caller mutated sMeters, lateralOffsetM, or headingErrorRad directly, re-sync Cartesian state
-    if (
-      this.sMeters !== this.lastSyncedSMeters ||
-      this.lateralOffsetM !== this.lastSyncedLateralOffsetM ||
-      this.headingErrorRad !== this.lastSyncedHeadingErrorRad
-    ) {
-      this.syncCartesianFromCurvilinear();
-    }
-
-    // Update tire compound parameters if user changed compound in UI
-    for (let i = 0; i < 4; i++) {
-      updateWheelCompoundParams(this.wheels[i], this.tireCompound);
-    }
-
-    const clampedDt = Math.min(dtSeconds, 0.05);
-    this.timeAccumulator += clampedDt;
-
-    const normalizedInputs: ControlInputs = {
-      throttle: THREE.MathUtils.clamp(rawInputs.throttle ?? 0, 0, 1),
-      brake: THREE.MathUtils.clamp(rawInputs.brake ?? 0, 0, 1),
-      steerLeft: THREE.MathUtils.clamp(rawInputs.steerLeft ?? 0, 0, 1),
-      steerRight: THREE.MathUtils.clamp(rawInputs.steerRight ?? 0, 0, 1),
-      analogSteer:
-        rawInputs.analogSteer !== undefined
-          ? THREE.MathUtils.clamp(rawInputs.analogSteer, -1, 1)
-          : undefined,
-      clutch: rawInputs.clutch,
-      manualOverride: Boolean(rawInputs.manualOverride),
-      toggleXMode: Boolean(rawInputs.toggleXMode),
-      shiftUp: Boolean(rawInputs.shiftUp),
-      shiftDown: Boolean(rawInputs.shiftDown),
-    };
-
-    // Edge-triggered X-Mode toggle
-    if (normalizedInputs.toggleXMode && !this.prevToggleXMode) {
-      this.autoXMode = false;
-      this.activeAeroMode =
-        this.activeAeroMode === 'Z_MODE' ? 'X_MODE' : 'Z_MODE';
-    }
-    this.prevToggleXMode = normalizedInputs.toggleXMode;
-
-    // Edge-triggered manual gear shifts
-    let shiftReq: -1 | 0 | 1 = 0;
-    if (normalizedInputs.shiftUp && !this.prevShiftUp) {
-      shiftReq = 1;
-    } else if (normalizedInputs.shiftDown && !this.prevShiftDown) {
-      shiftReq = -1;
-    }
-    this.prevShiftUp = normalizedInputs.shiftUp;
-    this.prevShiftDown = normalizedInputs.shiftDown;
-
-    // Fixed-timestep 500 Hz sub-stepping loop (`dt = 0.002s`)
-    let stepsRun = 0;
-    while (this.timeAccumulator >= F1Physics2026.FIXED_DT && stepsRun < 30) {
-      this.integrateSubStep(
-        F1Physics2026.FIXED_DT,
-        normalizedInputs,
-        stepsRun === 0 ? shiftReq : 0
-      );
-      this.timeAccumulator -= F1Physics2026.FIXED_DT;
-      this.simTimeMs += F1Physics2026.FIXED_DT * 1000;
-      stepsRun++;
-    }
-
-    // If frame dt was smaller than 0.002s (e.g. >500 Hz monitor or micro-step test),
-    // still ensure telemetry and world transform are up to date
-    if (stepsRun === 0 && dtSeconds > 0 && dtSeconds < F1Physics2026.FIXED_DT) {
-      this.integrateSubStep(dtSeconds, normalizedInputs, shiftReq);
-      this.timeAccumulator = 0;
-      this.simTimeMs += dtSeconds * 1000;
-    }
-
-    this.syncWorldTransform();
-    const currentSample = this.track.getSampleAtDistance(this.sMeters);
-    this.lastObservation = this.buildObservation(currentSample);
-    this.updateTelemetrySnapshot(currentSample, normalizedInputs);
-
-    return this.telemetry;
-  }
-
-  /**
-   * Executes one 500 Hz (`dt = 0.002s`) physics step following the exact TORCS/Speed Dreams
-   * `SimUpdateSingleCar` execution order (`simu.cpp` lines 255-345).
-   */
-  private integrateSubStep(
-    dt: number,
-    inputs: ControlInputs,
-    shiftRequest: -1 | 0 | 1
-  ): void {
-    const sample = this.track.getSampleAtDistance(this.sMeters);
-
-    // =========================================================================
-    // 1. ctrlCheck: Driver / Single-Track MPC AI Input Conditioning
-    // =========================================================================
-    let throttleCmd = inputs.throttle;
-    let brakeCmd = inputs.brake;
-    let torcsSteerCmd = 0; // +1 = Left, -1 = Right in TORCS convention
-
-    if (this.aiAutopilot) {
-      this.lastObservation = this.buildObservation(sample);
-      const aiOut = evaluateSingleTrackMpcAi(
-        this.lastObservation,
-        this.track,
-        this.sMeters,
-        this.wheelbaseM,
-        this.config.steer.steerLockRad
-      );
-      torcsSteerCmd = aiOut.steerCmd;
-      throttleCmd = aiOut.throttleCmd;
-      brakeCmd = aiOut.brakeCmd;
-      this.activeAeroMode = aiOut.aeroMode;
-      this.drivetrain.engine.ersMode = aiOut.ersMode;
-      this.rawSteerFiltered = -torcsSteerCmd;
-    } else {
-      // Player manual steering input (+1 = Right, -1 = Left in UI convention)
-      const rawUiSteer =
-        inputs.analogSteer !== undefined
-          ? THREE.MathUtils.clamp(inputs.analogSteer, -1, 1)
-          : inputs.steerRight - inputs.steerLeft;
-
-      // Progressive speed-sensitive steering filtering so keyboard taps feel crisp yet smooth
-      const hasInput = Math.abs(rawUiSteer) > 0.005;
-      const filterRate = hasInput ? 11.5 : 16.0;
-      this.rawSteerFiltered +=
-        (rawUiSteer - this.rawSteerFiltered) * Math.min(1.0, filterRate * dt);
-      if (!hasInput && Math.abs(this.rawSteerFiltered) < 1e-4) {
-        this.rawSteerFiltered = 0;
-      }
-
-      // Speed-sensitive steering ratio (full authority in slow/medium corners, progressive high-speed authority at 300+ km/h)
-      const excessSpeed = Math.max(0, Math.abs(this.vxMs) - 34.0);
-      const speedSensitivity =
-        1.0 / (1.0 + Math.pow(excessSpeed / 58.0, 1.45));
-      const minHighSpeedAuthority = 0.34;
-      const effectiveUiSteer =
-        this.rawSteerFiltered * Math.max(minHighSpeedAuthority, speedSensitivity);
-
-      torcsSteerCmd = -effectiveUiSteer; // Convert UI (+right) to TORCS (+left)
-
-      // Manual Override (/Boost)
-      if (inputs.manualOverride) {
-        this.drivetrain.engine.ersMode = 'OVERRIDE';
-      } else if (this.drivetrain.engine.boostRemainingS <= 0) {
-        this.drivetrain.engine.ersMode = 'BALANCED';
-      }
-
-      // Auto X-Mode active aero on designated DRS/straight zones when not braking
-      if (this.autoXMode) {
-        const canXMode =
-          sample.drsZone &&
-          brakeCmd < 0.05 &&
-          Math.abs(this.rawSteerFiltered) < 0.18 &&
-          this.vxMs > 38;
-        this.activeAeroMode = canXMode ? 'X_MODE' : 'Z_MODE';
-      }
-    }
-
-    // Closed-loop Pacejka peak-slip traction control modulation (in semi_pro / assisted)
-    if (this.assistPreset !== 'pro' && throttleCmd > 0.2) {
-      const maxRearSlip = Math.max(
-        this.wheels[2].combinedSlipNorm,
-        this.wheels[3].combinedSlipNorm
-      );
-      const slipThreshold = this.assistPreset === 'assisted' ? 0.94 : 1.04;
-      if (maxRearSlip > slipThreshold) {
-        throttleCmd *= Math.max(0.48, 1.0 - (maxRearSlip - slipThreshold) * 0.85);
-      }
-    }
-
-    // =========================================================================
-    // 2. SimSteerUpdate (Ackermann Front Wheel Geometry)
-    // =========================================================================
-    simSteerUpdate(
-      this.drivetrain.steer,
-      this.config.steer,
-      torcsSteerCmd,
-      this.wheelbaseM,
-      this.wheeltrackM,
-      dt
-    );
-    this.wheels[0].steerRad = this.drivetrain.steer.wheelSteerFR;
-    this.wheels[1].steerRad = this.drivetrain.steer.wheelSteerFL;
-    this.wheels[2].steerRad = 0;
-    this.wheels[3].steerRad = 0;
-
-    // UI steering properties (+ = right)
-    this.frontWheelAngleRad = -this.drivetrain.steer.steerRad;
-    this.steerAngleNorm = THREE.MathUtils.clamp(
-      this.frontWheelAngleRad / this.config.steer.steerLockRad,
-      -1,
-      1
-    );
-
-    // =========================================================================
-    // 3. SimGearboxUpdate (8-Speed Seamless Gearbox & Clutch)
-    // =========================================================================
-    simGearboxUpdate(
-      this.drivetrain,
-      this.config.transmission,
-      this.config.engine,
-      this.vxMs,
-      throttleCmd,
-      brakeCmd,
-      shiftRequest,
-      this.autoGearbox,
-      dt
-    );
-    this.gear = this.drivetrain.gearbox.gear;
-
-    // =========================================================================
-    // 4. SimEngineUpdateTq (ICE Torque Curve + Engine Braking + 350kW MGU-K)
-    // =========================================================================
-    simEngineUpdateTq(
-      this.drivetrain.engine,
-      this.config.engine,
-      throttleCmd,
-      brakeCmd,
-      this.vxMs,
-      dt
-    );
-    this.rpm = this.drivetrain.engine.rpm;
-    this.ersEnergyJ = this.drivetrain.engine.ersEnergyJ;
-
-    // =========================================================================
-    // 5. SimCarUpdateWheelPos (4-Wheel World Coordinates & Hub Body Velocities)
-    // =========================================================================
-    this.updateWheelWorldPositions(sample);
-
-    // In TORCS convention, yawRateAz is positive counter-clockwise (turning left),
-    // which is `-this.yawRateRadS`
-    const yawRateTorcs = -this.yawRateRadS;
-    for (let i = 0; i < 4; i++) {
-      const w = this.wheels[i];
-      // From SimCarUpdateWheelPos in car.cpp lines 851-852:
-      // bodyVel.x = vx - yawRate * y; bodyVel.y = vy + yawRate * x
-      w.bodyVel.x = this.vxMs - yawRateTorcs * w.staticPos.y;
-      w.bodyVel.y = this.vyMs + yawRateTorcs * w.staticPos.x;
-    }
-
-    // =========================================================================
-    // 6. SimBrakeSystemUpdate (Hydraulic Bias, ABS & Carbon Disc Thermal Glow)
-    // =========================================================================
-    simBrakeSystemUpdate(
-      this.drivetrain,
-      this.config.brakeSystem,
-      brakeCmd,
-      this.vxMs,
-      [
-        this.wheels[0].spinVel,
-        this.wheels[1].spinVel,
-        this.wheels[2].spinVel,
-        this.wheels[3].spinVel,
-      ],
-      [
-        this.wheels[0].slipRatio,
-        this.wheels[1].slipRatio,
-        this.wheels[2].slipRatio,
-        this.wheels[3].slipRatio,
-      ],
-      dt
-    );
-
-    // =========================================================================
-    // 7. SimAeroUpdate & SimWingUpdate (Ground Effect + Active Z/X-Mode Wings)
-    // =========================================================================
-    const altitudeM = BASE_ALTITUDE_M + sample.position.y;
-    this.config.aero.airDensity = this.computeAirDensity(altitudeM);
-    const aeroSetup = AERO_SETUP_MULT[this.aeroPreset];
-
-    updateSimAero(
-      this.aeroState,
-      this.config.aero,
-      this.vxMs,
-      this.vyMs,
-      [
-        this.wheels[0].rideHeight,
-        this.wheels[1].rideHeight,
-        this.wheels[2].rideHeight,
-        this.wheels[3].rideHeight,
-      ],
-      this.activeAeroMode === 'X_MODE' ? 'X-MODE' : 'Z-MODE',
-      dt
-    );
-    this.aeroState.frontDownforceN *= aeroSetup.downforce;
-    this.aeroState.rearDownforceN *= aeroSetup.downforce;
-    this.aeroState.totalDownforceN =
-      this.aeroState.frontDownforceN + this.aeroState.rearDownforceN;
-    this.aeroState.totalDragN *= aeroSetup.drag;
-    this.aeroState.drag *= aeroSetup.drag;
-
-    // =========================================================================
-    // 8. SimWheelUpdateRide (Per-Wheel Surface Query & 4-Corner Suspension)
-    // =========================================================================
-    const totalMass = this.config.dryMassKg + this.drivetrain.engine.fuelKg;
-    // Dynamic load transfer from chassis pitch/roll accelerations
-    const longLoadTransferN =
-      (totalMass * this.lastAxMs2 * this.cgHeightM) / this.wheelbaseM;
-    const latLoadTransferN =
-      (totalMass * this.lastAyMs2 * this.cgHeightM) / this.wheeltrackM;
-
-    for (let i = 0; i < 4; i++) {
-      const w = this.wheels[i];
-      const contact = queryWheelGroundContact(
-        this.track,
-        w.worldPos.x,
-        w.worldPos.z,
-        this.sMeters + w.staticPos.x,
-        Math.abs(this.vxMs)
-      );
-      w.zRoad = contact.zRoad;
-      w.surfaceType = contact.surfaceType;
-      w.surfaceFrictionMult = contact.frictionMult;
-      w.surfaceBumpM = contact.bumpM;
-
-      // Compute dynamic suspension deflection from static equilibrium + aero + pitch/roll + surface bump
-      const isFront = i < 2;
-      const isRight = i % 2 === 0;
-      const axle = isFront ? this.axles[0] : this.axles[1];
-
-      const susp = this.suspensions[i];
-      const aeroCorner = isFront
-        ? this.aeroState.frontDownforceN * 0.5
-        : this.aeroState.rearDownforceN * 0.5;
-      // Under braking (lastAxMs2 < 0), longLoadTransferN < 0 -> front compresses (+), rear extends (-)
-      const pitchShift = isFront ? -longLoadTransferN * 0.5 : longLoadTransferN * 0.5;
-      // In TORCS body frame, turning left gives lastAyMs2 > 0 -> outside Right wheels compress (+), inside Left extend (-)
-      const rollShift = isRight ? latLoadTransferN * 0.5 : -latLoadTransferN * 0.5;
-
-      const effectiveCornerK = Math.max(50_000, susp.spring.K * susp.bellcrank);
-      const effectiveHeaveK = effectiveCornerK + 0.5 * axle.heaveSusp.spring.K;
-      const effectiveRollK = effectiveCornerK + 2.0 * axle.arbStiffness;
-      const dynamicExtraDeflection =
-        (aeroCorner + pitchShift) / effectiveHeaveK + rollShift / effectiveRollK;
-
-      // Set wheel vertical world position relative to road so SimWheelUpdateRide
-      // computes the exact physical compression (including kerb/surface bump)
-      w.worldPos.y = w.zRoad - dynamicExtraDeflection;
-
-      const wheelStateForRide = {
-        ...w,
-        worldPos: { x: w.worldPos.x, y: w.worldPos.z, z: w.worldPos.y },
-      };
-      simWheelUpdateRide(
-        wheelStateForRide,
-        this.config.wheels[i],
-        susp,
-        this.rollRad,
-        contact.bankRad,
-        dt
-      );
-      w.rideHeight = wheelStateForRide.rideHeight;
-      w.effCamberRad = wheelStateForRide.effCamberRad;
-    }
-
-    // =========================================================================
-    // 9. SimAxleUpdate (Front & Rear Anti-Roll Bars + 3rd/Heave Springs)
-    // =========================================================================
-    simAxleUpdate(this.axles[0], this.suspensions[0], this.suspensions[1], dt);
-    simAxleUpdate(this.axles[1], this.suspensions[2], this.suspensions[3], dt);
-
-    // =========================================================================
-    // 10. SimWheelUpdateForce (4-Wheel Contact Patch Pacejka Magic Formula)
-    // =========================================================================
-    const ambientTempC = 27; // Kigali tropical ambient temperature
-    for (let i = 0; i < 4; i++) {
-      const isFront = i < 2;
-      const axle = isFront ? this.axles[0] : this.axles[1];
-
-      // Note: aeroCorner is already transmitted through susp.force + axle.thirdForcePerWheel
-      // via dynamicExtraDeflection above, so we pass 0 for extra external Fz to avoid double-counting.
-      simWheelUpdateForce(
-        this.wheels[i],
-        this.config.wheels[i],
-        this.suspensions[i],
-        axle,
-        0,
-        this.tireCompound,
-        ambientTempC,
-        dt
-      );
-    }
-
-    // =========================================================================
-    // 11. SimDifferentialUpdate (1.5-Way Salisbury LSD & Engine RPM Coupling)
-    // =========================================================================
-    const rearSpinVels: [number, number] = [
-      this.wheels[2].spinVel,
-      this.wheels[3].spinVel,
-    ];
-    simDifferentialUpdate(
-      this.drivetrain,
-      this.config,
-      rearSpinVels,
-      [this.drivetrain.brakes[2].tqNm, this.drivetrain.brakes[3].tqNm],
-      throttleCmd,
-      dt
-    );
-    this.wheels[2].spinVel = rearSpinVels[0];
-    this.wheels[3].spinVel = rearSpinVels[1];
-    this.rpm = this.drivetrain.engine.rpm;
-
-    // =========================================================================
-    // 12. SimWheelUpdateRotation (4-Wheel Rotational Spin Dynamics & Lockup)
-    // =========================================================================
-    for (let i = 0; i < 4; i++) {
-      const isRear = i >= 2;
-      const driveTq = isRear ? this.drivetrain.rearDiff.outTq[i - 2] : 0;
-      const effI = isRear
-        ? this.drivetrain.rearDiff.outI[i - 2]
-        : this.config.wheels[i].inertia + this.config.wheels[i].brakeInertia;
-
-      simWheelUpdateRotation(
-        this.wheels[i],
-        this.config.wheels[i],
-        this.drivetrain.brakes[i],
-        driveTq,
-        effI,
-        this.vxMs,
-        throttleCmd,
-        dt
-      );
-    }
-    this.wheelRotationRad = this.wheels[0].rotationRad;
-
-    // =========================================================================
-    // 13. SimCarUpdate (Sum Forces & Moments, Integrate Rigid-Body Velocities & Pose)
-    // =========================================================================
-    const invMass = 1.0 / totalMass;
-    const weightN = totalMass * GRAVITY;
-
-    // Longitudinal gravity component along track slope & lateral banking component
-    const fGravX = -weightN * sample.slopeSin;
-    // Banking supports cornering inside turns; gate by corner curvature so straightaways never pull sideways
-    const curvatureBankGate = THREE.MathUtils.clamp(
-      (Math.abs(sample.curvature) - 0.0018) / 0.004,
-      0,
-      1
-    );
-    const fGravY =
-      -weightN *
-      Math.sin(sample.bankingRad) *
-      Math.cos(this.headingErrorRad) *
-      0.48 *
-      curvatureBankGate;
-
-    let sumFx = fGravX + this.aeroState.drag + this.aeroState.wings[0].forceX + this.aeroState.wings[1].forceX;
-    let sumFy = fGravY;
-    let sumMzTorcs = 0;
-    let totalRollRes = 0;
-
-    for (let i = 0; i < 4; i++) {
-      const w = this.wheels[i];
-      sumFx += w.forcesCar.x;
-      sumFy += w.forcesCar.y;
-      totalRollRes += w.rollResN;
-
-      // Yaw moment Mz from car.cpp lines 674-676:
-      // F.M.z += -wheel[i].forces.x * wheel[i].staticPos.y + wheel[i].forces.y * wheel[i].staticPos.x
-      sumMzTorcs +=
-        -w.forcesCar.x * w.staticPos.y +
-        w.forcesCar.y * w.staticPos.x -
-        w.torqueAlignNm;
-    }
-
-    // Rolling resistance opposing velocity vector (car.cpp lines 693-715)
-    const speed2D = Math.hypot(this.vxMs, this.vyMs);
-    if (speed2D > 1e-4) {
-      const rv = speed2D > 10.0 ? totalRollRes / speed2D : totalRollRes / 10.0;
-      const clampedRv = Math.min(rv, (speed2D * totalMass) / dt);
-      sumFx -= clampedRv * this.vxMs;
-      sumFy -= clampedRv * this.vyMs;
-    }
-
-    // 4-wheel Pacejka lateral tire forces & pneumatic trail govern yaw and lateral dynamics,
-    // supplemented by physical shark-fin / rear-wing aerodynamic weathervane stability (Cn_beta)
-    // and scaling up during extreme slides (>20 deg heading error) or off-track excursions.
-    const isOffTrack = Math.abs(this.lateralOffsetM) > sample.width * 0.5;
-    const slideIntensity = THREE.MathUtils.clamp(
-      (Math.abs(this.headingErrorRad) - 0.35) / 0.55 + (isOffTrack ? 0.35 : 0),
-      0,
-      1
-    );
-    const aeroWeathervaneMz =
-      slideIntensity * Math.max(8.0, Math.abs(this.vxMs)) * this.vyMs * 32.0 -
-      yawRateTorcs * (85.0 + slideIntensity * (450.0 + Math.abs(this.vxMs) * 16.0));
-    sumMzTorcs += aeroWeathervaneMz;
-
-    // Crucial Symmetry & Straight-Line Stability Guarantee:
-    // When steering input is zero (`Math.abs(torcsSteerCmd) < 1e-4`),
-    // any microscopic floating-point or surface asymmetry is zeroed and lateral slip velocity / yaw rate
-    // are naturally damped by the 4-tire cornering stiffness so the car never turns on its own.
-    if (
-      Math.abs(torcsSteerCmd) < 1e-4 &&
-      Math.abs(this.vyMs) < 0.01 &&
-      Math.abs(this.yawRateRadS) < 0.01
-    ) {
-      sumFy = 0;
-      sumMzTorcs = 0;
-      this.vyMs = 0;
-      this.yawRateRadS = 0;
-    }
-
-    // Compute linear & angular accelerations in car frame
-    const axCar = sumFx * invMass;
-    const ayCar = sumFy * invMass;
-    const yawAccelTorcs = sumMzTorcs / this.yawInertiaKgM2;
-
-    // Integrate velocities (`SimCarUpdateSpeed` in `car.cpp`)
-    // Include centripetal coupling in body frame: dvx/dt = ax + vy * r, dvy/dt = ay - vx * r
-    this.vxMs += (axCar + this.vyMs * yawRateTorcs) * dt;
-    this.vyMs += (ayCar - this.vxMs * yawRateTorcs) * dt;
-
-    const latDamping = Math.exp(-(0.20 + 3.2 * slideIntensity) * dt);
-    const yawDamping = Math.exp(-(0.15 + 4.2 * slideIntensity) * dt);
-    this.vyMs *= latDamping;
-    const nextYawRateTorcs = (yawRateTorcs + yawAccelTorcs * dt) * yawDamping;
-    this.yawRateRadS = THREE.MathUtils.clamp(-nextYawRateTorcs, -4.5, 4.5);
-
-    // FEAT_SLOWGRIP (`car.cpp` lines 723-757):
-    // Prevent stationary turning, sideways creep, or backward rolling when parked!
-    if (Math.abs(this.vxMs) < 0.06 && throttleCmd < 0.02) {
-      this.vxMs = 0;
-      this.vyMs = 0;
-      this.yawRateRadS = 0;
-      this.lastAxMs2 = 0;
-      this.lastAyMs2 = 0;
-    } else if (Math.abs(this.vxMs) < 0.08) {
-      // Even when throttle is just cracked at standstill, yaw rate scales strictly with forward motion
-      // so the car NEVER spins in place when speed is 0!
-      const motionGate = Math.min(1.0, Math.abs(this.vxMs) / 0.08);
-      this.yawRateRadS *= motionGate;
-      this.vyMs *= motionGate;
-    }
-
-    // Clamp reverse speed if not in reverse gear
-    if (this.gear >= 0 && this.vxMs < 0) {
-      this.vxMs = 0;
-    }
-
-    this.lastAxMs2 += (axCar - this.lastAxMs2) * Math.min(1.0, 18.0 * dt);
-    this.lastAyMs2 += (ayCar - this.lastAyMs2) * Math.min(1.0, 18.0 * dt);
-
-    // Update 3D Chassis Pitch, Roll & Vertical Heave from suspension forces
-    const targetPitchRad = THREE.MathUtils.clamp(
-      this.lastAxMs2 * 0.00085,
-      -0.026,
-      0.026
-    );
-    const targetRollRad = THREE.MathUtils.clamp(
-      this.lastAyMs2 * 0.00095,
-      -0.032,
-      0.032
-    );
-    this.pitchRad += (targetPitchRad - this.pitchRad) * Math.min(1.0, 16.0 * dt);
-    this.rollRad += (targetRollRad - this.rollRad) * Math.min(1.0, 16.0 * dt);
-
-    const avgRideHeight =
-      0.25 *
-      (this.wheels[0].rideHeight +
-        this.wheels[1].rideHeight +
-        this.wheels[2].rideHeight +
-        this.wheels[3].rideHeight);
-    this.rideHeightOffsetM = avgRideHeight - 0.039;
-
-    // Integrate 3D Cartesian World Position `(worldX, worldZ)` and Yaw `worldYawRad` directly at 500 Hz
-    // so track spline curvature never injects phantom steering into the vehicle!
-    const prevS = this.sMeters;
-    if (Math.abs(this.vxMs) >= 0.05) {
-      this.worldYawRad = Math.atan2(
-        Math.sin(this.worldYawRad - this.yawRateRadS * dt),
-        Math.cos(this.worldYawRad - this.yawRateRadS * dt)
-      );
-    }
-
-    const sinYaw = Math.sin(this.worldYawRad);
-    const cosYaw = Math.cos(this.worldYawRad);
-    // Forward unit vector in XZ is (sinYaw, cosYaw); Left unit vector (+vyMs in TORCS) is (cosYaw, -sinYaw)
-    const vWorldX = this.vxMs * sinYaw + this.vyMs * cosYaw;
-    const vWorldZ = this.vxMs * cosYaw - this.vyMs * sinYaw;
-
-    this.worldX += vWorldX * dt;
-    this.worldZ += vWorldZ * dt;
-
-    // Project 3D Cartesian world position onto the track centerline spline for telemetry, AI, and surface queries
-    const projected = this.track.projectWorldToTrack(
-      this.worldX,
-      this.worldZ,
-      prevS
-    );
-    const nextSample = projected.sample;
-    this.sMeters = projected.s;
-    this.lateralOffsetM = projected.lateralOffset;
-
-    const trackHeadingRad = Math.atan2(
-      nextSample.tangent.x,
-      nextSample.tangent.z
-    );
-    let rawHeadingErr = trackHeadingRad - this.worldYawRad;
-    while (rawHeadingErr > Math.PI) rawHeadingErr -= Math.PI * 2;
-    while (rawHeadingErr < -Math.PI) rawHeadingErr += Math.PI * 2;
-    this.headingErrorRad = THREE.MathUtils.clamp(
-      rawHeadingErr,
-      -Math.PI * 0.48,
-      Math.PI * 0.48
-    );
-
-    if (
-      Math.abs(this.vxMs) >= 0.05 &&
-      Math.abs(this.headingErrorRad) > Math.PI * 0.32 &&
-      (Math.abs(torcsSteerCmd) > 1e-4 || Math.abs(this.yawRateRadS) > 0.01)
-    ) {
-      // Weathervane / rear-fin aerodynamic & countersteer alignment at extreme slip angles (>58 deg)
-      const excessRatio =
-        (Math.abs(this.headingErrorRad) - Math.PI * 0.32) / (Math.PI * 0.16);
-      this.headingErrorRad *= Math.exp(-2.2 * excessRatio * dt);
-      this.yawRateRadS *= Math.exp(-3.0 * excessRatio * dt);
-      this.worldYawRad = Math.atan2(
-        Math.sin(trackHeadingRad - this.headingErrorRad),
-        Math.cos(trackHeadingRad - this.headingErrorRad)
-      );
-    }
-
-    // Soft barrier containment at outer runoff wall (`halfWidth + 4.8m`)
-    const maxWallOffset = nextSample.width * 0.5 + 4.8;
-    if (Math.abs(this.lateralOffsetM) > maxWallOffset) {
-      this.lateralOffsetM = Math.sign(this.lateralOffsetM) * maxWallOffset;
-      this.vyMs *= Math.exp(-12.0 * dt);
-      this.vxMs *= Math.exp(-0.8 * dt);
-      this.headingErrorRad *= Math.exp(-3.2 * dt);
-      this.yawRateRadS *= Math.exp(-6.0 * dt);
-      this.worldX =
-        nextSample.position.x + nextSample.binormal.x * this.lateralOffsetM;
-      this.worldZ =
-        nextSample.position.z + nextSample.binormal.z * this.lateralOffsetM;
-      this.worldYawRad = Math.atan2(
-        Math.sin(trackHeadingRad - this.headingErrorRad),
-        Math.cos(trackHeadingRad - this.headingErrorRad)
-      );
-    }
-
-    this.lastSyncedSMeters = this.sMeters;
-    this.lastSyncedLateralOffsetM = this.lateralOffsetM;
-    this.lastSyncedHeadingErrorRad = this.headingErrorRad;
-
-    // Compute steering Force-Feedback (FFB) torque from front tire pneumatic trail self-aligning torque
-    const frontAlignTq =
-      (this.wheels[0].torqueAlignNm + this.wheels[1].torqueAlignNm) * 0.5;
-    const frontLatForce =
-      (this.wheels[0].fnN + this.wheels[1].fnN) * 0.5;
-    this.ffbTorqueNorm = THREE.MathUtils.clamp(
-      (frontAlignTq / 85.0) + (frontLatForce / 9500.0) * 0.65,
-      -1.0,
-      1.0
-    );
-
-    this.frontSlipRatioNorm = Math.max(
-      this.wheels[0].combinedSlipNorm,
-      this.wheels[1].combinedSlipNorm
-    );
-    this.rearSlipRatioNorm = Math.max(
-      this.wheels[2].combinedSlipNorm,
-      this.wheels[3].combinedSlipNorm
-    );
-
-    // Check sector & lap completion
-    if (nextSample.sector !== this.lastSector) {
-      this.onSectorCompleted(this.lastSector);
-      this.lastSector = nextSample.sector;
-    }
-    if (prevS > TRACK_TOTAL_LENGTH_M * 0.85 && this.sMeters < TRACK_TOTAL_LENGTH_M * 0.15) {
-      this.onLapCompleted();
-    }
-  }
-
-  /**
-   * Computes the 3D world positions of all 4 wheels from the current chassis pose.
-   */
-  private updateWheelWorldPositions(sample: ReturnType<BuiltTrackData['getSampleAtDistance']>): void {
-    const carGroundY = evaluateSampleLateralHeightM(sample, this.lateralOffsetM);
-    const carPos = new THREE.Vector3(this.worldX, carGroundY, this.worldZ);
-
-    const carUp = sample.normal.clone().normalize();
-    const hx = Math.sin(this.worldYawRad);
-    const hz = Math.cos(this.worldYawRad);
-    const fy =
-      Math.abs(carUp.y) > 1e-4 ? -(hx * carUp.x + hz * carUp.z) / carUp.y : 0;
-    const carForward = new THREE.Vector3(hx, fy, hz).normalize();
-    const carRight = new THREE.Vector3()
-      .crossVectors(carForward, carUp)
-      .normalize();
-
-    for (let i = 0; i < 4; i++) {
-      const w = this.wheels[i];
-      // staticPos.x is forward, staticPos.y is left (-staticPos.y is right)
-      const wp = carPos
-        .clone()
-        .addScaledVector(carForward, w.staticPos.x)
-        .addScaledVector(carRight, -w.staticPos.y);
-      w.worldPos.x = wp.x;
-      w.worldPos.y = wp.y;
-      w.worldPos.z = wp.z;
-    }
-  }
-
-  /**
-   * Builds the full `AssettoCorsaGymObservation` vector (`AssettoCorsaEnv/ac_env.py`)
-   */
-  private buildObservation(
-    sample: ReturnType<BuiltTrackData['getSampleAtDistance']>
-  ): AssettoCorsaGymObservation {
-    const { lookaheadCurvatures, lookaheadTargetSpeedsMs } = computeLookaheadVectors(
-      this.track,
-      this.sMeters
-    );
-    const racelineOffsetM = sample.racingLineOffset * sample.width * 0.30;
-    const gapToRacingLineM = this.lateralOffsetM - racelineOffsetM;
-
-    let wheelsOut = 0;
-    for (let i = 0; i < 4; i++) {
-      if (this.wheels[i].surfaceType === 'runoff' || this.wheels[i].surfaceType === 'grass') {
-        wheelsOut++;
-      }
-    }
-
-    return {
-      speedMs: this.vxMs,
-      localVelocityX: this.vxMs,
-      localVelocityY: this.vyMs,
-      localVelocityZ: this.vzMs,
-      angularVelocityX: this.rollVelRadS,
-      angularVelocityY: this.pitchVelRadS,
-      angularVelocityZ: -this.yawRateRadS,
-      accelX: this.lastAxMs2,
-      accelY: this.lastAyMs2,
-      rollRad: this.rollRad,
-      pitchRad: this.pitchRad,
-      yawRad: Math.atan2(sample.tangent.x, sample.tangent.z) - this.headingErrorRad,
-      engineRpm: this.rpm,
-      gear: this.gear,
-      normalizedSplinePosition: this.sMeters / TRACK_TOTAL_LENGTH_M,
-      gapToRacingLineM,
-      lateralOffsetCenterM: this.lateralOffsetM,
-      headingErrorRad: this.headingErrorRad,
-      slipAngleRad: [
-        this.wheels[0].slipAngleRad,
-        this.wheels[1].slipAngleRad,
-        this.wheels[2].slipAngleRad,
-        this.wheels[3].slipAngleRad,
-      ],
-      slipRatio: [
-        this.wheels[0].slipRatio,
-        this.wheels[1].slipRatio,
-        this.wheels[2].slipRatio,
-        this.wheels[3].slipRatio,
-      ],
-      tyreLoadN: [
-        this.wheels[0].fzN,
-        this.wheels[1].fzN,
-        this.wheels[2].fzN,
-        this.wheels[3].fzN,
-      ],
-      rideHeightM: [
-        this.wheels[0].rideHeight,
-        this.wheels[1].rideHeight,
-        this.wheels[2].rideHeight,
-        this.wheels[3].rideHeight,
-      ],
-      tyreTempC: [
-        this.wheels[0].tempC,
-        this.wheels[1].tempC,
-        this.wheels[2].tempC,
-        this.wheels[3].tempC,
-      ],
-      lookaheadCurvatures,
-      lookaheadTargetSpeedsMs,
-      wheelsOutOfTrack: wheelsOut,
-      outOfTrack: wheelsOut >= 3,
-    };
-  }
-
   private updateTelemetrySnapshot(
     sample: ReturnType<BuiltTrackData['getSampleAtDistance']>,
     inputs: ControlInputs
   ): void {
+    const t = this.telemetry;
+    const drv = this.drivetrain;
     const speedKmh = Math.max(0, this.vxMs * 3.6);
-    if (speedKmh > this.telemetry.topSpeedThisLapKmh) {
-      this.telemetry.topSpeedThisLapKmh = speedKmh;
-    }
-    if (speedKmh > this.telemetry.allTimeTopSpeedKmh) {
-      this.telemetry.allTimeTopSpeedKmh = speedKmh;
-    }
+    if (speedKmh > t.topSpeedThisLapKmh) t.topSpeedThisLapKmh = speedKmh;
+    if (speedKmh > t.allTimeTopSpeedKmh) t.allTimeTopSpeedKmh = speedKmh;
 
-    const eng = this.drivetrain.engine;
-    const icePowerKw = Math.max(0, (eng.tqIceNm * eng.rads) / 1000.0);
-    const mgukPowerKw = eng.mgukPowerKw;
-    const totalPowerKw = Math.max(0, icePowerKw + Math.max(0, mgukPowerKw));
+    const icePowerKw = Math.max(0, (drv.iceTorqueNm * drv.engineOmega) / 1000);
+    const mgukPowerKw = drv.mgukPowerW / 1000;
 
-    // Note: in `this.wheels`, indices are 0:FR, 1:FL, 2:RR, 3:RL (TORCS order).
-    // In `CarTelemetry`, 4-wheel arrays are ordered [FL, FR, RL, RR] (indices 1, 0, 3, 2).
-    const wFL = this.wheels[1];
-    const wFR = this.wheels[0];
-    const wRL = this.wheels[3];
-    const wRR = this.wheels[2];
+    // CarTelemetry 4-wheel arrays are ordered [FL, FR, RL, RR]
+    const order = [1, 0, 3, 2] as const;
+    const W = order.map((i) => this.wheels[i]);
+    const quad = <T,>(f: (w: VehicleWheelState) => T): [T, T, T, T] => [f(W[0]), f(W[1]), f(W[2]), f(W[3])];
 
-    const bFL = this.drivetrain.brakes[1];
-    const bFR = this.drivetrain.brakes[0];
-    const bRL = this.drivetrain.brakes[3];
-    const bRR = this.drivetrain.brakes[2];
-
-    const sFL = this.suspensions[1];
-    const sFR = this.suspensions[0];
-    const sRL = this.suspensions[3];
-    const sRR = this.suspensions[2];
-
-    const onKerbLeft = wFL.surfaceType === 'kerb' || wRL.surfaceType === 'kerb';
-    const onKerbRight = wFR.surfaceType === 'kerb' || wRR.surfaceType === 'kerb';
+    const onKerbLeft = W[0].surfaceType === 'kerb' || W[2].surfaceType === 'kerb';
+    const onKerbRight = W[1].surfaceType === 'kerb' || W[3].surfaceType === 'kerb';
     const offTrack = this.lastObservation.outOfTrack;
-    if (offTrack) {
-      this.lapValid = false;
-    }
+    if (offTrack) this.lapValid = false;
 
     let dominantSurface: SurfaceType = 'asphalt';
-    if (wFL.surfaceType === 'grass' || wFR.surfaceType === 'grass') {
-      dominantSurface = 'grass';
-    } else if (wFL.surfaceType === 'runoff' || wFR.surfaceType === 'runoff') {
-      dominantSurface = 'runoff';
-    } else if (onKerbLeft || onKerbRight) {
-      dominantSurface = 'kerb';
-    }
+    if (W[0].surfaceType === 'grass' || W[1].surfaceType === 'grass') dominantSurface = 'grass';
+    else if (W[0].surfaceType === 'runoff' || W[1].surfaceType === 'runoff') dominantSurface = 'runoff';
+    else if (onKerbLeft || onKerbRight) dominantSurface = 'kerb';
 
+    const markerS = (this.sMeters + 25) % this.track.totalLengthM;
     const brakingUrgency = evaluateDynamicBrakingUrgency(
       this.track,
       this.sMeters,
       this.vxMs,
-      (this.sMeters + 25) % TRACK_TOTAL_LENGTH_M,
-      this.track.getSampleAtDistance((this.sMeters + 25) % TRACK_TOTAL_LENGTH_M).optimalSpeedKmh / 3.6
+      markerS,
+      this.track.getSampleAtDistance(markerS).optimalSpeedKmh / 3.6
     );
 
-    const nowMs = this.simTimeMs;
-
-    this.telemetry.speedMs = this.vxMs;
-    this.telemetry.speedKmh = speedKmh;
-    this.telemetry.rpm = Math.round(this.rpm);
-    this.telemetry.gear = this.gear;
-    this.telemetry.throttle = this.aiAutopilot
-      ? THREE.MathUtils.clamp(eng.tqIceNm / 400, 0, 1)
-      : inputs.throttle;
-    this.telemetry.brake = this.aiAutopilot
-      ? THREE.MathUtils.clamp(bFL.pressurePa / this.config.brakeSystem.maxPressurePa, 0, 1)
+    t.speedMs = this.vxMs;
+    t.speedKmh = speedKmh;
+    t.rpm = Math.round(this.rpm);
+    t.gear = this.gear;
+    t.throttle = this.aiAutopilot ? THREE.MathUtils.clamp(drv.iceTorqueNm / 450, 0, 1) : inputs.throttle;
+    t.brake = this.aiAutopilot
+      ? THREE.MathUtils.clamp(this.wheels[1].brakeTorqueNm / (VF26_BRAKES.maxTorqueNm * VF26_BRAKES.frontBias), 0, 1)
       : inputs.brake;
-    this.telemetry.clutch = this.drivetrain.clutch.transferValue;
-    this.telemetry.steering = this.steerAngleNorm;
-    this.telemetry.longitudinalG = this.lastAxMs2 / GRAVITY;
-    this.telemetry.lateralG = -this.lastAyMs2 / GRAVITY;
-    this.telemetry.verticalG =
-      1.0 + this.aeroState.totalDownforceN / (this.massKg * GRAVITY);
+    t.clutch = drv.clutchLocked ? 1 : drv.clutchEngagement;
+    t.steering = this.steerAngleNorm;
+    t.longitudinalG = this.lastAxMs2 / G;
+    t.lateralG = -this.lastAyMs2 / G;
+    t.verticalG = 1 + this.aeroDownforceN / (this.totalMassKg * G);
 
-    this.telemetry.altitudeM = BASE_ALTITUDE_M + sample.position.y;
-    this.telemetry.trackElevationM = sample.position.y;
-    this.telemetry.airDensityKgM3 = this.config.aero.airDensity;
-    this.telemetry.activeAeroMode = this.activeAeroMode;
-    this.telemetry.autoXMode = this.autoXMode;
-    this.telemetry.downforceN = this.aeroState.totalDownforceN;
-    this.telemetry.downforceKgf = this.aeroState.totalDownforceN / GRAVITY;
-    this.telemetry.frontDownforceN = this.aeroState.frontDownforceN;
-    this.telemetry.rearDownforceN = this.aeroState.rearDownforceN;
-    this.telemetry.groundEffectFactor = this.aeroState.groundEffectFactor;
-    this.telemetry.dragN = this.aeroState.totalDragN;
+    t.altitudeM = BASE_ALTITUDE_M + sample.position.y;
+    t.trackElevationM = sample.position.y;
+    t.airDensityKgM3 = this.airDensity;
+    t.activeAeroMode = this.activeAeroMode;
+    t.autoXMode = this.autoXMode;
+    t.downforceN = this.aeroDownforceN;
+    t.downforceKgf = this.aeroDownforceN / G;
+    t.frontDownforceN = this.aeroFrontDownforceN;
+    t.rearDownforceN = this.aeroRearDownforceN;
+    t.groundEffectFactor = this.groundEffectFactor;
+    t.dragN = this.aeroDragN;
 
-    this.telemetry.icePowerKw = icePowerKw;
-    this.telemetry.mgukPowerKw = mgukPowerKw;
-    this.telemetry.totalPowerKw = totalPowerKw;
-    this.telemetry.ersBatteryPercent =
-      (this.ersEnergyJ / this.maxErsEnergyJ) * 100;
-    this.telemetry.manualOverrideActive =
-      eng.ersMode === 'OVERRIDE' || eng.boostRemainingS > 0;
-    this.telemetry.boostRemainingS = eng.boostRemainingS;
-    this.telemetry.turboBoostBar =
-      1.0 + 2.4 * this.telemetry.throttle * Math.min(1, this.rpm / 10500);
-    this.telemetry.fuelKg = eng.fuelKg;
+    t.icePowerKw = icePowerKw;
+    t.mgukPowerKw = mgukPowerKw;
+    t.totalPowerKw = Math.max(0, icePowerKw + Math.max(0, mgukPowerKw));
+    t.ersBatteryPercent = (drv.ersEnergyJ / VF26_ERS.batteryJ) * 100;
+    t.manualOverrideActive = drv.ersMode === 'OVERRIDE' || drv.boostRemainingS > 0;
+    t.boostRemainingS = drv.boostRemainingS;
+    t.turboBoostBar = 1 + drv.boostBar;
+    t.fuelKg = drv.fuelKg;
 
-    this.telemetry.tireSlipRatio = [
-      wFL.combinedSlipNorm,
-      wFR.combinedSlipNorm,
-      wRL.combinedSlipNorm,
-      wRR.combinedSlipNorm,
-    ];
-    this.telemetry.wheelSlipRatios = [
-      wFL.slipRatio,
-      wFR.slipRatio,
-      wRL.slipRatio,
-      wRR.slipRatio,
-    ];
-    this.telemetry.wheelSlipAnglesDeg = [
-      THREE.MathUtils.radToDeg(wFL.slipAngleRad),
-      THREE.MathUtils.radToDeg(wFR.slipAngleRad),
-      THREE.MathUtils.radToDeg(wRL.slipAngleRad),
-      THREE.MathUtils.radToDeg(wRR.slipAngleRad),
-    ];
-    this.telemetry.wheelLoadsN = [
-      Math.round(wFL.fzN),
-      Math.round(wFR.fzN),
-      Math.round(wRL.fzN),
-      Math.round(wRR.fzN),
-    ];
-    this.telemetry.wheelRideHeightsMm = [
-      Math.round(wFL.rideHeight * 1000),
-      Math.round(wFR.rideHeight * 1000),
-      Math.round(wRL.rideHeight * 1000),
-      Math.round(wRR.rideHeight * 1000),
-    ];
-    this.telemetry.suspensionTravelMm = [
-      Math.round(sFL.x * 1000),
-      Math.round(sFR.x * 1000),
-      Math.round(sRL.x * 1000),
-      Math.round(sRR.x * 1000),
-    ];
-    this.telemetry.tireTempsC = [
-      Math.round(wFL.tempC),
-      Math.round(wFR.tempC),
-      Math.round(wRL.tempC),
-      Math.round(wRR.tempC),
-    ];
-    this.telemetry.tireWearPct = [
-      Number(wFL.wearPct.toFixed(1)),
-      Number(wFR.wearPct.toFixed(1)),
-      Number(wRL.wearPct.toFixed(1)),
-      Number(wRR.wearPct.toFixed(1)),
-    ];
-    this.telemetry.tireGripFactor = [
-      Number((wFL.effectiveMu / this.config.wheels[1].mu0).toFixed(2)),
-      Number((wFR.effectiveMu / this.config.wheels[0].mu0).toFixed(2)),
-      Number((wRL.effectiveMu / this.config.wheels[3].mu0).toFixed(2)),
-      Number((wRR.effectiveMu / this.config.wheels[2].mu0).toFixed(2)),
-    ];
-    this.telemetry.brakeTempsC = [bFL.tempC, bFR.tempC, bRL.tempC, bRR.tempC];
-    this.telemetry.wheelSurfaces = [
-      wFL.surfaceType,
-      wFR.surfaceType,
-      wRL.surfaceType,
-      wRR.surfaceType,
-    ];
+    t.tireSlipRatio = quad((w) => w.combinedSlipNorm);
+    t.wheelSlipRatios = quad((w) => w.slipRatio);
+    t.wheelSlipAnglesDeg = quad((w) => THREE.MathUtils.radToDeg(w.slipAngleRad));
+    t.wheelLoadsN = quad((w) => Math.round(w.fzN));
+    t.wheelRideHeightsMm = quad((w) => Math.round(w.rideHeight * 1000));
+    t.suspensionTravelMm = quad((w) => {
+      const ax = w.isFront ? this.axles[0] : this.axles[1];
+      return Math.round((ax.staticSpringDeflection + w.suspCompression) * 1000);
+    });
+    t.tireTempsC = quad((w) => Math.round(0.6 * w.tyre.surfaceTempC + 0.4 * w.tyre.coreTempC));
+    t.tireWearPct = quad((w) => Number((w.tyre.wear * 100).toFixed(1)));
+    t.tireGripFactor = quad((w) => Number(w.gripFactor.toFixed(2)));
+    t.brakeTempsC = quad((w) => Math.round(w.brakeTempC));
+    t.wheelSurfaces = quad((w) => w.surfaceType);
 
-    this.telemetry.frontSlipAngleDeg =
-      0.5 *
-      (this.telemetry.wheelSlipAnglesDeg[0] +
-        this.telemetry.wheelSlipAnglesDeg[1]);
-    this.telemetry.rearSlipAngleDeg =
-      0.5 *
-      (this.telemetry.wheelSlipAnglesDeg[2] +
-        this.telemetry.wheelSlipAnglesDeg[3]);
-    this.telemetry.ffbTorqueNorm = this.ffbTorqueNorm;
-    this.telemetry.ffbClipping = Math.abs(this.ffbTorqueNorm) > 0.94;
+    t.frontSlipAngleDeg = 0.5 * (t.wheelSlipAnglesDeg[0] + t.wheelSlipAnglesDeg[1]);
+    t.rearSlipAngleDeg = 0.5 * (t.wheelSlipAnglesDeg[2] + t.wheelSlipAnglesDeg[3]);
+    t.ffbTorqueNorm = this.ffbTorqueNorm;
+    t.ffbClipping = Math.abs(this.ffbTorqueNorm) > 0.95;
 
-    this.telemetry.onKerbLeft = onKerbLeft;
-    this.telemetry.onKerbRight = onKerbRight;
-    this.telemetry.offTrack = offTrack;
-    this.telemetry.surface = dominantSurface;
+    t.onKerbLeft = onKerbLeft;
+    t.onKerbRight = onKerbRight;
+    t.offTrack = offTrack;
+    t.surface = dominantSurface;
 
-    this.telemetry.trackDistanceM = this.sMeters;
-    this.telemetry.trackProgress = this.sMeters / TRACK_TOTAL_LENGTH_M;
-    this.telemetry.lateralOffsetM = this.lateralOffsetM;
-    this.telemetry.gapToRacingLineM = this.lastObservation.gapToRacingLineM;
-    this.telemetry.headingErrorRad = this.headingErrorRad;
-    this.telemetry.targetCornerSpeedKmh = Math.round(sample.optimalSpeedKmh);
-    this.telemetry.brakingUrgency = brakingUrgency;
-    this.telemetry.currentSector = sample.sector;
-    this.telemetry.currentTurnNumber = sample.turnNumber;
-    this.telemetry.currentTurnName = sample.turnName;
-    this.telemetry.bankingDeg = THREE.MathUtils.radToDeg(sample.bankingRad);
-    this.telemetry.slopePercent = sample.slopeSin * 100;
-    this.telemetry.currentLapTimeMs = Math.max(0, nowMs - this.currentLapStartMs);
-    this.telemetry.aiAutopilot = this.aiAutopilot;
+    t.trackDistanceM = this.sMeters;
+    t.trackProgress = this.sMeters / this.track.totalLengthM;
+    t.lateralOffsetM = this.lateralOffsetM;
+    t.gapToRacingLineM = this.lastObservation.gapToRacingLineM;
+    t.headingErrorRad = this.headingErrorRad;
+    t.targetCornerSpeedKmh = this.aiAutopilot ? this.aiTargetSpeedKmh : Math.round(sample.optimalSpeedKmh);
+    t.brakingUrgency = brakingUrgency;
+    t.currentSector = sample.sector;
+    t.currentTurnNumber = sample.turnNumber;
+    t.currentTurnName = sample.turnName;
+    t.bankingDeg = THREE.MathUtils.radToDeg(sample.bankingRad);
+    t.slopePercent = sample.slopeSin * 100;
+    t.currentLapTimeMs = Math.max(0, this.simTimeMs - this.currentLapStartMs);
+    t.aiAutopilot = this.aiAutopilot;
   }
 
   private onSectorCompleted(completedSector: 1 | 2 | 3): void {
     const nowMs = this.simTimeMs;
     const sectorDuration = nowMs - this.currentSectorStartMs;
     this.currentSectorStartMs = nowMs;
-
     const idx = completedSector - 1;
     if (sectorDuration > 8000) {
       this.telemetry.sectorTimesMs[idx] = sectorDuration;
@@ -1473,53 +1870,30 @@ export class F1Physics2026 {
     const lapTime = nowMs - this.currentLapStartMs;
     this.onSectorCompleted(3);
     this.currentLapStartMs = nowMs;
-
     if (lapTime > 45_000) {
       this.telemetry.lastLapTimeMs = lapTime;
-      if (
-        this.telemetry.bestLapTimeMs === null ||
-        (this.lapValid && lapTime < this.telemetry.bestLapTimeMs)
-      ) {
+      if (this.lapValid && (this.telemetry.bestLapTimeMs === null || lapTime < this.telemetry.bestLapTimeMs)) {
         this.telemetry.bestLapTimeMs = lapTime;
       }
     }
-
     this.telemetry.lapCount++;
     this.telemetry.topSpeedThisLapKmh = this.vxMs * 3.6;
-    this.ersEnergyJ = Math.min(this.maxErsEnergyJ, this.ersEnergyJ + 1_500_000);
-    this.drivetrain.engine.ersEnergyJ = this.ersEnergyJ;
     this.lapValid = true;
   }
 
   private syncWorldTransform(): void {
     const sample = this.track.getSampleAtDistance(this.sMeters);
     const exactGroundY = evaluateSampleLateralHeightM(sample, this.lateralOffsetM);
-
     this.worldPosition.set(this.worldX, exactGroundY, this.worldZ);
 
-    // Derive surface normal from local lateral slope across the car's track width and longitudinal slope
-    const yLeft = evaluateSampleLateralHeightM(sample, this.lateralOffsetM - 0.8);
-    const yRight = evaluateSampleLateralHeightM(sample, this.lateralOffsetM + 0.8);
-    const localBankRad = Math.atan2(yLeft - yRight, 1.6);
-
-    const rightFlat = new THREE.Vector3(-sample.tangent.z, 0, sample.tangent.x).normalize();
-    const upFlat = new THREE.Vector3().crossVectors(rightFlat, sample.tangent).normalize();
-    const carUp = upFlat.applyAxisAngle(sample.tangent, localBankRad).normalize();
+    const carUp = this.localRoadUp(sample);
 
     const hx = Math.sin(this.worldYawRad);
     const hz = Math.cos(this.worldYawRad);
-    const fy =
-      Math.abs(carUp.y) > 1e-4 ? -(hx * carUp.x + hz * carUp.z) / carUp.y : 0;
+    const fy = Math.abs(carUp.y) > 1e-4 ? -(hx * carUp.x + hz * carUp.z) / carUp.y : 0;
     const carForward = new THREE.Vector3(hx, fy, hz).normalize();
-    const carLeft = new THREE.Vector3()
-      .crossVectors(carUp, carForward)
-      .normalize();
-
-    const basisMatrix = new THREE.Matrix4().makeBasis(
-      carLeft,
-      carUp,
-      carForward
-    );
-    this.worldQuaternion.setFromRotationMatrix(basisMatrix);
+    const carLeft = new THREE.Vector3().crossVectors(carUp, carForward).normalize();
+    const basis = new THREE.Matrix4().makeBasis(carLeft, carUp, carForward);
+    this.worldQuaternion.setFromRotationMatrix(basis);
   }
 }

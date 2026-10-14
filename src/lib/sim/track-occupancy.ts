@@ -11,7 +11,7 @@
 
 import * as THREE from 'three';
 import { SurfaceType, TrackSamplePoint } from '@/types/f1';
-import { BuiltTrackData, evaluateSampleLateralHeightM } from '@/lib/track-data';
+import { BuiltTrackData, catmullRomWeights, evaluateSampleLateralHeightM } from '@/lib/track-data';
 
 export const CURV_LOOK_AHEAD_DISTANCE = 300; // meters (from assetto_corsa_gym ac_env.py)
 export const CURV_LOOK_AHEAD_VECTOR_SIZE = 12; // 12 lookahead samples
@@ -84,47 +84,16 @@ export function queryWheelGroundContact(
   approxS: number,
   carSpeedMs: number
 ): WheelGroundContact {
-  const totalLen = track.totalLengthM;
-  const numSamples = track.samples.length;
-  const stepM = totalLen / numSamples;
-  const centerIdx =
-    Math.floor((((approxS % totalLen) + totalLen) % totalLen) / stepM) % numSamples;
+  const stepM = track.totalLengthM / track.samples.length;
 
-  let bestIdx = centerIdx;
-  let bestDistSq = Infinity;
-  const searchRadius = 24;
-
-  for (let offset = -searchRadius; offset <= searchRadius; offset++) {
-    const idx = (centerIdx + offset + numSamples) % numSamples;
-    const sp = track.samples[idx];
-    const dx = worldX - sp.position.x;
-    const dz = worldZ - sp.position.z;
-    const dSq = dx * dx + dz * dz;
-    if (dSq < bestDistSq) {
-      bestDistSq = dSq;
-      bestIdx = idx;
-    }
-  }
-
-  const s0 = track.samples[bestIdx];
-  const sNext = track.samples[(bestIdx + 1) % numSamples];
-  const segX = sNext.position.x - s0.position.x;
-  const segZ = sNext.position.z - s0.position.z;
-  const segLenSq = Math.max(1e-4, segX * segX + segZ * segZ);
-  const relX = worldX - s0.position.x;
-  const relZ = worldZ - s0.position.z;
-  const t = Math.max(0, Math.min(1, (relX * segX + relZ * segZ) / segLenSq));
-
-  // Interpolated center point & horizontal binormal
-  const cx = s0.position.x + segX * t;
-  const cz = s0.position.z + segZ * t;
-
-  const bx = s0.binormal.x + (sNext.binormal.x - s0.binormal.x) * t;
-  const bz = s0.binormal.z + (sNext.binormal.z - s0.binormal.z) * t;
-  const bLen = Math.hypot(bx, bz) || 1;
+  // Continuous segment / lateral location (see BuiltTrackData.locateWorldPoint)
+  const loc = track.locateWorldPoint(worldX, worldZ, approxS);
+  const s0 = track.samples[loc.i0];
+  const sNext = track.samples[loc.i1];
+  const t = loc.t;
 
   // Signed lateral offset from track centerline (+right along horizontal binormal, -left)
-  const lateralOffsetM = ((worldX - cx) * bx + (worldZ - cz) * bz) / bLen;
+  const lateralOffsetM = loc.lateralH;
   const absLat = Math.abs(lateralOffsetM);
 
   const halfWidthM = (s0.width + (sNext.width - s0.width) * t) * 0.5;
@@ -132,10 +101,15 @@ export function queryWheelGroundContact(
   const slopeSin = s0.slopeSin + (sNext.slopeSin - s0.slopeSin) * t;
   const pitchSlopeRad = Math.asin(THREE.MathUtils.clamp(slopeSin, -0.5, 0.5));
 
-  // Exact KN5 3D surface elevation at wheel lateral position interpolated from the 9-point cross-section profile
-  const z0 = evaluateSampleLateralHeightM(s0, lateralOffsetM);
-  const z1 = evaluateSampleLateralHeightM(sNext, lateralOffsetM);
-  const zRoad = z0 + (z1 - z0) * t;
+  // KN5 surface elevation at the wheel's lateral position from the 9-point cross-section
+  // profiles, Catmull-Rom interpolated along the track (same as getSampleAtDistance)
+  const n = track.samples.length;
+  const [w0, w1, w2, w3] = catmullRomWeights(t);
+  const zRoad =
+    w0 * evaluateSampleLateralHeightM(track.samples[(loc.i0 - 1 + n) % n], lateralOffsetM) +
+    w1 * evaluateSampleLateralHeightM(s0, lateralOffsetM) +
+    w2 * evaluateSampleLateralHeightM(sNext, lateralOffsetM) +
+    w3 * evaluateSampleLateralHeightM(track.samples[(loc.i1 + 1) % n], lateralOffsetM);
 
   // Classify surface under this specific wheel (asphalt, kerb, runoff, grass)
   const kerbInner = halfWidthM - 0.35;
@@ -208,6 +182,10 @@ export function computeLookaheadVectors(
  * Evaluates the dynamic braking urgency (`0.0` = full throttle green, `0.5` = caution/lift yellow,
  * `1.0` = heavy threshold braking red) for a racing line marker at track distance `markerS`
  * given the player's current speed `carSpeedMs` and position `carS`.
+ *
+ * A marker is red when it lies inside the distance the car needs to slow from its current speed
+ * to the target speed of a slower point further along the line. Target speeds are the samples'
+ * `optimalSpeedKmh`, i.e. the VF26 speed profile.
  */
 export function evaluateDynamicBrakingUrgency(
   track: BuiltTrackData,
@@ -220,60 +198,32 @@ export function evaluateDynamicBrakingUrgency(
   const deltaS = (markerS - carS + totalLen) % totalLen;
   const markerSample = track.getSampleAtDistance(markerS);
 
-  // Evaluate dynamic braking urgency for markers within 260m ahead of the car
-  if (deltaS <= 260) {
-    const tMargin = 0.04;
-    let maxUrgency = 0;
+  // Markers further ahead just show the static braking zones
+  if (deltaS > 260) return THREE.MathUtils.clamp(markerSample.brakingZone, 0, 1);
 
-    // Look ahead from markerS up to 160m to see if markerS lies inside the physical braking zone
-    // required to decelerate from carSpeedMs down to the instantaneous cornering grip speed vGrip at checkS
-    for (let distFromMarker = 0; distFromMarker <= 160; distFromMarker += 6) {
-      const checkS = (markerS + distFromMarker) % totalLen;
-      const sp = track.getSampleAtDistance(checkS);
-      const absK = Math.abs(sp.curvature);
-
-      if (absK > 0.0055) {
-        const bankBonus = Math.max(0, Math.tan(Math.abs(sp.bankingRad))) * 9.81;
-        const hairpinFactor = THREE.MathUtils.clamp((absK - 0.020) / 0.012, 0, 1);
-        const a0 = 17.8 - 2.4 * hairpinFactor + bankBonus * 1.25;
-        const effK = Math.max(0.0022, absK - 0.0038 * (1.0 - 0.55 * hairpinFactor));
-        const vGrip = THREE.MathUtils.clamp(Math.sqrt(a0 / effK), 18.5, 98.5);
-
-        // Only trigger if checkS is stricter than the marker's local optimal speed (i.e. approaching/entering corner, not exiting)
-        const isCornerApproach =
-          distFromMarker === 0
-            ? markerSample.brakingZone > 0.1
-            : vGrip < markerOptimalSpeedMs - 0.5;
-
-        if (isCornerApproach && carSpeedMs > vGrip + 1.0) {
-          const vRmsSq = 0.5 * (carSpeedMs * carSpeedMs + vGrip * vGrip);
-          const aEff = 26.5 + 8.5 * Math.min(1.2, vRmsSq / (88.0 * 88.0));
-          const dBrake =
-            (carSpeedMs * carSpeedMs - vGrip * vGrip) / (2.0 * aEff) +
-            carSpeedMs * tMargin;
-
-          if (distFromMarker <= dBrake) {
-            maxUrgency = Math.max(maxUrgency, 1.0);
-            break;
-          } else if (distFromMarker <= dBrake + 35.0) {
-            const blend = 1.0 - (distFromMarker - dBrake) / 35.0;
-            maxUrgency = Math.max(maxUrgency, 0.35 + 0.6 * blend);
-          }
-        }
-      }
+  const tMargin = 0.04;
+  let maxUrgency = 0;
+  for (let distFromMarker = 5; distFromMarker <= 200; distFromMarker += 5) {
+    const vTarget = track.getSampleAtDistance((markerS + distFromMarker) % totalLen).optimalSpeedKmh / 3.6;
+    // Only slower points ahead of the marker (corner approach, not exit) that the car is too fast for
+    if (vTarget >= markerOptimalSpeedMs - 0.5 || carSpeedMs <= vTarget + 1) continue;
+    // Mean deceleration: ≈2.7 g at low speed up to ≈3.6 g with full downforce
+    const vRmsSq = 0.5 * (carSpeedMs * carSpeedMs + vTarget * vTarget);
+    const aEff = 26.5 + 8.5 * Math.min(1.2, vRmsSq / (88.0 * 88.0));
+    const dBrake = (carSpeedMs * carSpeedMs - vTarget * vTarget) / (2.0 * aEff) + carSpeedMs * tMargin;
+    if (distFromMarker <= dBrake) {
+      maxUrgency = 1.0;
+      break;
     }
-
-    // Also keep markers inside an active corner braking zone red while the car is threshold-braking along the optimal deceleration curve
-    if (
-      markerSample.brakingZone >= 0.5 &&
-      carSpeedMs >= markerOptimalSpeedMs - 2.5 &&
-      deltaS <= 125
-    ) {
-      maxUrgency = Math.max(maxUrgency, 1.0);
+    if (distFromMarker <= dBrake + 35.0) {
+      maxUrgency = Math.max(maxUrgency, 0.35 + 0.6 * (1.0 - (distFromMarker - dBrake) / 35.0));
     }
-
-    return THREE.MathUtils.clamp(maxUrgency, 0, 1);
   }
 
-  return THREE.MathUtils.clamp(markerSample.brakingZone, 0, 1);
+  // Keep markers inside a braking zone red while the car is still above the target speed there
+  if (markerSample.brakingZone >= 0.5 && carSpeedMs >= markerOptimalSpeedMs - 2.5 && deltaS <= 125) {
+    maxUrgency = 1.0;
+  }
+
+  return THREE.MathUtils.clamp(maxUrgency, 0, 1);
 }
