@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import type { CarTelemetry, LiveryConfig, TireCompound } from "@/types/f1";
+import { attachVf26Model, loadVf26Template, type Vf26ModelInstance } from "@/lib/vf26-car-model";
 
 export interface F1CarRig2026 {
   root: THREE.Group;
@@ -17,6 +18,10 @@ export interface F1CarRig2026 {
   brakeGlowMaterials: THREE.MeshStandardMaterial[];
   setLivery: (livery: LiveryConfig) => void;
   setTireCompound: (compound: TireCompound) => void;
+  /** AC EVO camera anchors once the VF26 model has replaced the procedural car (null until then) */
+  getVf26CameraAnchors: () => Vf26ModelInstance["cameraAnchors"] | null;
+  /** Hide the VF26 driver's helmet while the camera is at the eye point */
+  setCockpitView: (inCockpit: boolean) => void;
   updateFromTelemetry: (
     telemetry: CarTelemetry,
     pitchRad: number,
@@ -814,6 +819,8 @@ export function createF1Car2026(
   const root = new THREE.Group();
   const chassisGroup = new THREE.Group();
   root.add(chassisGroup);
+  /** VF26 mod model; replaces the procedural car once loaded (see the end of this function) */
+  let vf26: Vf26ModelInstance | null = null;
 
   const carbonTex = createCarbonWeaveTexture();
 
@@ -2582,7 +2589,10 @@ export function createF1Car2026(
     haloSponsorTex.redraw(livery);
   };
 
+  let currentCompound = initialCompound;
   const setTireCompound = (compound: TireCompound) => {
+    currentCompound = compound;
+    vf26?.setTireCompound(compound);
     const col = TIRE_STRIPE_COLORS[compound];
     tireStripeMat.color.setHex(col);
     tireStripeMat.emissive.setHex(col);
@@ -2597,6 +2607,10 @@ export function createF1Car2026(
   ) => {
     chassisGroup.rotation.x = pitchRad;
     chassisGroup.rotation.z = rollRad;
+    if (vf26) {
+      vf26.update(telemetry, wheelRotationRad, _dtOrOffset > 0 && _dtOrOffset < 0.25 ? _dtOrOffset : 1 / 60);
+      return;
+    }
 
     const steerVisualAngle = -telemetry.steering * 0.38;
     // Ackermann steering geometry: inside wheel turns ~10% sharper than outside wheel
@@ -2604,7 +2618,9 @@ export function createF1Car2026(
     const rightAckermann = telemetry.steering > 0 ? 1.06 : 0.94;
     frontLeftSteerPivot.rotation.y = steerVisualAngle * leftAckermann;
     frontRightSteerPivot.rotation.y = steerVisualAngle * rightAckermann;
-    steeringWheelGroup.rotation.z = -telemetry.steering * 1.45;
+    // telemetry.steering + = right turn; +rotation.z about the forward axis turns the rim clockwise as seen
+    // from the seat (top of the rim moves toward -X = right)
+    steeringWheelGroup.rotation.z = telemetry.steering * 1.45;
     syncDriverForearms();
 
     liveOled.update(telemetry);
@@ -2669,6 +2685,15 @@ export function createF1Car2026(
     }
   };
 
+  // Swap in the VF26 mod model when it has been converted locally (public/vf26/model/vf26.glb)
+  const proceduralParts = [...chassisGroup.children, ...root.children.filter((c) => c !== chassisGroup)];
+  void loadVf26Template().then((template) => {
+    if (!template) return;
+    vf26 = attachVf26Model(template, root, chassisGroup);
+    vf26.setTireCompound(currentCompound);
+    for (const part of proceduralParts) part.visible = false;
+  });
+
   return {
     root,
     chassisGroup,
@@ -2685,6 +2710,8 @@ export function createF1Car2026(
     brakeGlowMaterials,
     setLivery,
     setTireCompound,
+    getVf26CameraAnchors: () => vf26?.cameraAnchors ?? null,
+    setCockpitView: (inCockpit: boolean) => vf26?.setHeadVisible(!inCockpit),
     updateFromTelemetry,
   };
 }

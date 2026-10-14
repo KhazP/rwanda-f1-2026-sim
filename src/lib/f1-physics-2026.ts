@@ -69,6 +69,7 @@ import {
   queryWheelGroundContact,
 } from './sim/track-occupancy';
 import { type AiVehicleParams, RacingLineDriver } from './sim/ai-mpc';
+import { GamepadSteeringAssist } from './sim/gamepad-assist';
 import {
   aiLineOffsetM,
   computeSpeedProfile,
@@ -160,6 +161,10 @@ export class F1Physics2026 {
   public assistPreset: DriverAssistPreset = 'semi_pro';
   public tireCompound: TireCompound = 'soft';
   public autoGearbox = true;
+  /** Gamepad steering assist for `ControlInputs.padSteer` (off = raw stick to the rack) */
+  public gamepadAssistEnabled = true;
+  public readonly gamepadAssist = new GamepadSteeringAssist();
+  private padSteerActive = false;
 
   // Vehicle state (3D Cartesian world + projected curvilinear track state)
   public worldX = 0;
@@ -433,6 +438,7 @@ export class F1Physics2026 {
       steerRight: THREE.MathUtils.clamp(rawInputs.steerRight ?? 0, 0, 1),
       analogSteer:
         rawInputs.analogSteer !== undefined ? THREE.MathUtils.clamp(rawInputs.analogSteer, -1, 1) : undefined,
+      padSteer: rawInputs.padSteer !== undefined ? THREE.MathUtils.clamp(rawInputs.padSteer, -1, 1) : undefined,
       clutch: rawInputs.clutch,
       manualOverride: Boolean(rawInputs.manualOverride),
       toggleXMode: Boolean(rawInputs.toggleXMode),
@@ -577,6 +583,7 @@ export class F1Physics2026 {
     this.tcCut = 1;
     this.absFactor = [1, 1, 1, 1];
     this.aiDriver.reset();
+    this.gamepadAssist.reset();
     this.aiFrontCourseRad = 0;
     this.aiBrakeTrim = 1;
     this.aiThrottleTrim = 1;
@@ -753,7 +760,33 @@ export class F1Physics2026 {
       this.activeAeroMode = ai.aeroMode;
       if (drv.boostRemainingS <= 0) drv.ersMode = ai.ersMode;
     } else {
-      steerNorm = inputs.analogSteer !== undefined ? inputs.analogSteer : inputs.steerRight - inputs.steerLeft;
+      if (inputs.padSteer !== undefined) {
+        // Start from a clean state when the stick takes over from keyboard / mouse steering
+        if (!this.padSteerActive) this.gamepadAssist.reset();
+        this.padSteerActive = true;
+        steerNorm = this.gamepadAssistEnabled
+          ? this.gamepadAssist.update(
+              inputs.padSteer,
+              {
+                vxMs: this.vxMs,
+                vyMs: this.vyMs,
+                yawRateRadS: this.yawRateRadS,
+                cgToFrontAxleM: this.cgToFrontAxleM,
+                cgToRearAxleM: this.cgToRearAxleM,
+                wheelbaseM: this.wheelbaseM,
+                maxSteerAngleRad: this.maxSteerAngleRad,
+                frontPeakSlipRad: VF26_TYRES[this.tireCompound].front.frictionLimitAngleDeg * DEG2RAD,
+                brake,
+                // Measured on the flat pad: ≈1.75 × (g + downforce / m) from 90 to 240 km/h
+                maxLateralAccel: 1.75 * (G + this.aeroDownforceN / this.massKg),
+              },
+              dt
+            )
+          : inputs.padSteer;
+      } else {
+        this.padSteerActive = false;
+        steerNorm = inputs.analogSteer !== undefined ? inputs.analogSteer : inputs.steerRight - inputs.steerLeft;
+      }
 
       if (inputs.manualOverride && drv.ersEnergyJ > 0) {
         drv.ersMode = 'OVERRIDE';
@@ -771,11 +804,26 @@ export class F1Physics2026 {
     drv.launchPedal = throttle;
 
     // ---- 2. Driver aids (only when selected) -----------------------------------
-    const tcTarget = this.assistPreset === 'assisted' ? 0.1 : this.assistPreset === 'semi_pro' ? 0.13 : 0;
+    // Traction control works on the friction circle: the wheelspin it allows shrinks as the rear
+    // tyres use more of their grip for cornering, so a throttle stab mid-corner is cut before the
+    // rear is pushed past its combined-slip peak. Target = combined normalised slip (1 = peak).
+    const tcTarget = this.assistPreset === 'assisted' ? 0.9 : this.assistPreset === 'semi_pro' ? 1.0 : 0;
     if (tcTarget > 0 && this.vxMs > 2) {
-      const rearSlip = Math.max(this.wheels[2].slipRatio, this.wheels[3].slipRatio);
-      const want = rearSlip > tcTarget ? Math.max(0.15, 1 - (rearSlip - tcTarget) * 9) : 1;
-      this.tcCut += (want - this.tcCut) * Math.min(1, (want < this.tcCut ? 60 : 12) * dt);
+      // The worst rear wheel decides; a lightly loaded inside wheel counts a bit less
+      const fzMean = 0.5 * (this.wheels[2].fzN + this.wheels[3].fzN);
+      let excess = 0;
+      for (let i = 2; i < 4; i++) {
+        const w = this.wheels[i];
+        const sk = w.slipRatio / w.tyre.spec.peakSlipRatio;
+        const sa = Math.abs(Math.tan(w.slipAngleRad)) / w.tyre.tanPeakAngle;
+        // Some drive is always allowed, except when the tyre is already at its lateral limit
+        const skFloor = THREE.MathUtils.lerp(0.4, 0.12, THREE.MathUtils.clamp((sa - 0.75) / 0.3, 0, 1));
+        const skAllowed = Math.sqrt(Math.max(skFloor * skFloor, tcTarget * tcTarget - sa * sa));
+        const loadWeight = fzMean > 1 ? Math.min(1, (1.5 * w.fzN) / fzMean) : 0;
+        excess = Math.max(excess, Math.max(0, sk - skAllowed) * loadWeight);
+      }
+      const want = Math.max(0.05, 1 - excess * 4);
+      this.tcCut += (want - this.tcCut) * Math.min(1, (want < this.tcCut ? 80 : 10) * dt);
       throttle *= this.tcCut;
     } else {
       this.tcCut = 1;

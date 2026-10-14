@@ -17,11 +17,20 @@
  *    - Per-wheel (`i = 0..3`) tire squeal & scrub driven by combined slip `s = hypot(sx, sy)`
  *      multiplied by vertical normal load `Fz` (`0.4 * s * Fz * 0.0002 - 0.1`)
  *    - Kerb rumble strip impact resonance and off-track grass/gravel skid layers.
+ *
+ * When the locally converted VF26 mod sounds are present (`public/vf26/audio/`, see `vf26-audio.ts`),
+ * engine, turbo, transmission, shifts and backfires come from the mod's FMOD bank instead of the
+ * samples / oscillators above; tyre, kerb, gravel and wind layers stay procedural.
  */
 
 import * as THREE from 'three';
-import { TelemetryData } from '@/types/f1';
+import { CameraMode, TelemetryData } from '@/types/f1';
 import { withBasePath } from '@/lib/base-path';
+import { Vf26SoundBank } from './vf26-audio';
+import { VF26_ENGINE } from './vf26-data';
+
+/** Cameras mounted on the car use the mod's interior engine event; the rest hear the exterior one */
+const INTERIOR_CAMERAS: ReadonlySet<CameraMode> = new Set<CameraMode>(['cockpit', 'cockpit_shoulder', 'nose', 'tv_pod']);
 
 
 interface SampleLayerDef {
@@ -116,6 +125,10 @@ export class CarAudioEngine {
   private sampleNodes: ActiveSampleNode[] = [];
   private samplesLoaded = false;
   private isLoadingSamples = false;
+
+  // VF26 mod sound bank (null until loaded; stays null when the converted assets are absent)
+  private vf26: Vf26SoundBank | null = null;
+  private cameraMode: CameraMode = 'chase';
 
   private isMuted = false;
   public isInitialized = false;
@@ -306,7 +319,33 @@ export class CarAudioEngine {
     this.windGain = windGain;
 
     this.isInitialized = true;
-    void this.loadRealSamples(ctx, engineSampleBus);
+    void this.loadEngineSounds(ctx, compressor, engineSampleBus);
+  }
+
+  /** Prefer the VF26 mod bank; fall back to the bundled F1 loops when it is not available */
+  private async loadEngineSounds(ctx: AudioContext, vf26Destination: AudioNode, fallbackDestination: AudioNode): Promise<void> {
+    const bank = new Vf26SoundBank(ctx, vf26Destination);
+    const ok = await bank.load(INTERIOR_CAMERAS.has(this.cameraMode) ? 'int' : 'ext');
+    if (ok && this.ctx === ctx) {
+      this.vf26 = bank;
+      // Silence the legacy engine voices that the bank replaces
+      this.subHarmonicGain?.gain.setTargetAtTime(0, ctx.currentTime, 0.05);
+      this.turboGain?.gain.setTargetAtTime(0, ctx.currentTime, 0.05);
+      this.axleGain?.gain.setTargetAtTime(0, ctx.currentTime, 0.05);
+      return;
+    }
+    bank.dispose();
+    await this.loadRealSamples(ctx, fallbackDestination);
+  }
+
+  /** Current camera, used to pick the interior or exterior engine sound */
+  public setCameraMode(mode: CameraMode): void {
+    this.cameraMode = mode;
+  }
+
+  /** True when the VF26 mod sound bank is playing instead of the bundled samples */
+  public get usingVf26Sounds(): boolean {
+    return this.vf26?.ready === true;
   }
 
   private createPinkNoiseBuffer(ctx: AudioContext, durationSec: number): AudioBuffer {
@@ -385,12 +424,28 @@ export class CarAudioEngine {
   /**
    * Per-frame audio synthesis update ported from Speed Dreams `CarSoundData.cpp`
    */
-  public update(telemetry: TelemetryData, _dtSeconds?: number): void {
+  public update(telemetry: TelemetryData, dtSeconds?: number): void {
     if (!this.isInitialized || !this.ctx || this.isMuted) return;
     if (this.ctx.state === 'suspended') return;
 
     const now = this.ctx.currentTime;
     const tau = 0.024;
+
+    const vf26 = this.vf26?.ready ? this.vf26 : null;
+    if (vf26) {
+      vf26.update(
+        {
+          rpm: telemetry.rpm,
+          throttle: telemetry.throttle,
+          gear: telemetry.gear,
+          speedKmh: telemetry.speedKmh,
+          boostBarGauge: Math.max(0, telemetry.turboBoostBar - 1),
+          view: INTERIOR_CAMERAS.has(this.cameraMode) ? 'int' : 'ext',
+          limiterRpm: VF26_ENGINE.limiterRpm,
+        },
+        THREE.MathUtils.clamp(dtSeconds ?? 1 / 60, 0, 0.1)
+      );
+    }
 
     const rawRpm = THREE.MathUtils.clamp(telemetry.rpm, 4000, 15000);
     this.smoothedRpm += (rawRpm - this.smoothedRpm) * 0.28;
@@ -455,7 +510,7 @@ export class CarAudioEngine {
 
     // Subtle low-end V6 3rd-order firing frequency reinforcement (only low-passed warmth)
     const f0 = (rpm / 60) * 3.0;
-    if (this.subHarmonicOsc && this.subHarmonicGain && this.subHarmonicFilter) {
+    if (!vf26 && this.subHarmonicOsc && this.subHarmonicGain && this.subHarmonicFilter) {
       this.subHarmonicOsc.frequency.setTargetAtTime(f0 * 0.5, now, tau);
       this.subHarmonicFilter.frequency.setTargetAtTime(Math.min(260, f0 * 0.85), now, tau);
       const subLevel = (this.samplesLoaded ? 0.055 : 0.16) * (0.4 + 0.6 * this.smoothAccel) * shiftDip;
@@ -465,7 +520,7 @@ export class CarAudioEngine {
     // Turbo lag model (`turbo_lag`, `turbo_ilag` in `CarSoundData.cpp` lines 163-168)
     this.turboLag = 0.9 * this.turboLag + 0.1 * this.smoothAccel;
     const turboIlag = Math.exp(-3.0 * this.turboLag);
-    if (this.turboOsc && this.turboGain) {
+    if (!vf26 && this.turboOsc && this.turboGain) {
       const turboFreq = 1650 + (1.0 - turboIlag) * 2400 + mp * 850;
       const turboAmp = THREE.MathUtils.clamp((1.0 - turboIlag) * 0.022 * mp, 0, 0.025);
       this.turboOsc.frequency.setTargetAtTime(turboFreq, now, tau);
@@ -476,7 +531,7 @@ export class CarAudioEngine {
     const speedMs = Math.max(0, telemetry.speedKmh / 3.6);
     const u2 = speedMs * speedMs;
 
-    if (this.axleOsc && this.axleGain) {
+    if (!vf26 && this.axleOsc && this.axleGain) {
       // axle.a = 0.2 * sqrt(sqrt(u2) * 0.05), axle.f = sqrt(u2) * 0.06
       const axleFreq = 320 + speedMs * 16.5 + Math.abs(telemetry.mgukPowerKw) * 1.1;
       const axleAmp = THREE.MathUtils.clamp(
@@ -568,6 +623,8 @@ export class CarAudioEngine {
       }
     }
     this.sampleNodes = [];
+    this.vf26?.dispose();
+    this.vf26 = null;
     if (this.ctx) {
       void this.ctx.close();
       this.ctx = null;

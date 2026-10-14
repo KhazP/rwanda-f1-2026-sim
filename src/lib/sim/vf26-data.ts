@@ -171,11 +171,18 @@ export interface Vf26AxleSuspension {
   arbRate: number;
   /** Unsprung mass per corner (kg) [assumed] */
   unsprungMassKg: number;
-  /** Static camber (deg, negative = top in) [setup] */
+  /**
+   * Static camber at static ride height (deg, negative = top in) [setup: the camber setting, field 4.2. The
+   * setup's field 4.5 (-2.74 / -0.72) is the STATIC_CAMBER offset the game solved at the hardpoint reference
+   * so that the car sits at the set camber; it is not the static camber]
+   */
   staticCamberDeg: number;
-  /** Camber change per metre of bump (deg/m, negative = more negative camber in bump) [derived from hardpoints] */
+  /**
+   * Camber change per metre of bump (deg/m, negative = more negative camber in bump) [derived from hardpoints:
+   * 3D wishbone kinematics with the inclined arm axes. Consistent with the setup's 4.2 vs 4.5 offsets]
+   */
   camberGainDegPerM: number;
-  /** Static toe (deg, + = toe-in) [setup] */
+  /** Static toe (deg, + = toe-in) [setup: the toe setting, field 4.3; field 4.6 is the solved TOE_OUT rod offset] */
   staticToeDeg: number;
   /** Static floor ride height at this axle (m) [setup] */
   staticRideHeight: number;
@@ -196,7 +203,7 @@ export const VF26_CHASSIS = {
   totalMassKg: 768,
   /** Default race fuel (kg) [setup] */
   fuelKg: 40,
-  /** Tank capacity (kg) [mod] */
+  /** Tank capacity (kg) [assumed — 110 is not in the package; cardata field 1.6 = 120 may be the tank size] */
   fuelTankKg: 110,
   /** Fuel use at full throttle (kg/s) — 2026 energy-flow limit (≈ 70 kg/h) [assumed] */
   fuelFlowKgS: 0.0194,
@@ -232,9 +239,9 @@ export const VF26_CHASSIS = {
     heaveDamping: 7000,
     arbRate: 64000,
     unsprungMassKg: 13,
-    staticCamberDeg: -2.75,
-    camberGainDegPerM: -4.4,
-    staticToeDeg: 0,
+    staticCamberDeg: -2.6,
+    camberGainDegPerM: 4.6,
+    staticToeDeg: 0.1,
     staticRideHeight: 0.044,
     track: 1.55,
     baseY: -0.072,
@@ -261,9 +268,9 @@ export const VF26_CHASSIS = {
     heaveDamping: 8000,
     arbRate: 20000,
     unsprungMassKg: 15,
-    staticCamberDeg: -0.72,
-    camberGainDegPerM: -24,
-    staticToeDeg: 0.1,
+    staticCamberDeg: -1.0,
+    camberGainDegPerM: -12.7,
+    staticToeDeg: 0.2,
     staticRideHeight: 0.06,
     track: 1.476,
     baseY: -0.074,
@@ -452,10 +459,13 @@ export const VF26_DRIVETRAIN = {
   autoClutchFullRpm: 5500,
   /** Engine speed the auto-clutch holds off the line at full pedal (rpm) [assumed: typical F1 launch] */
   launchRpm: 10500,
-  /** Limited-slip differential [mod: preload; power/coast assumed — mod defers to setup] */
-  diffPreloadNm: 200,
-  diffPowerLock: 0.4,
-  diffCoastLock: 0.2,
+  /**
+   * Limited-slip differential [setup: default setup power 0.20 / coast 0.10 / preload 45 Nm; field
+   * order inferred from the setup limits 0–0.5 / 0–0.5 / 0–150 Nm. The drivetrain base is 0.15 / 0.3 / 150]
+   */
+  diffPreloadNm: 45,
+  diffPowerLock: 0.2,
+  diffCoastLock: 0.1,
 } as const;
 
 // ---------------------------------------------------------------------------

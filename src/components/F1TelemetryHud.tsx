@@ -49,6 +49,8 @@ interface F1TelemetryHudProps {
   isMuted: boolean;
   boostLatch: boolean;
   mouseSteerEnabled?: boolean;
+  gamepadAssist?: boolean;
+  onToggleGamepadAssist?: () => void;
   p2pStatus?: P2PConnectionStatus;
   onChangeAeroPreset: (preset: AeroSetupPreset) => void;
   onChangeAssistPreset: (preset: DriverAssistPreset) => void;
@@ -112,6 +114,8 @@ export const F1TelemetryHud: React.FC<F1TelemetryHudProps> = ({
   isMuted,
   boostLatch,
   mouseSteerEnabled = false,
+  gamepadAssist = true,
+  onToggleGamepadAssist,
   p2pStatus,
   onChangeAeroPreset,
   onChangeAssistPreset,
@@ -719,7 +723,7 @@ export const F1TelemetryHud: React.FC<F1TelemetryHudProps> = ({
 
                 <div>
                   <label className="mb-1 block font-f1-italic text-[11px] uppercase text-zinc-300">
-                    Traction & ABS (No Auto-Steer):
+                    Traction & ABS:
                   </label>
                   <div className="grid grid-cols-3 gap-1">
                     {(
@@ -743,6 +747,20 @@ export const F1TelemetryHud: React.FC<F1TelemetryHudProps> = ({
                       </button>
                     ))}
                   </div>
+                  {onToggleGamepadAssist ? (
+                    <button
+                      type="button"
+                      onClick={onToggleGamepadAssist}
+                      title="Controller steering like Assetto Corsa's Advanced Gamepad Assist: the stick steers up to the front tyres' grip limit and the wheel self-aligns to catch slides"
+                      className={`mt-1 w-full rounded border py-1.5 font-f1-italic text-[10px] uppercase cursor-pointer ${
+                        gamepadAssist
+                          ? "border-[#00D26A] bg-[#00D26A]/25 text-white"
+                          : "border-white/10 bg-[#0B0B10] text-zinc-400"
+                      }`}
+                    >
+                      Gamepad Steering Assist: {gamepadAssist ? "On" : "Off"}
+                    </button>
+                  ) : null}
                 </div>
               </div>
 

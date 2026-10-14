@@ -19,15 +19,23 @@ A high-frequency, browser-based **2026 Formula 1 Grand Prix Simulator** set at t
   - **Active Aerodynamics (`Z-Mode` & `X-Mode`)**: Switch between high-downforce cornering configuration (`Z-Mode`) and low-drag straight-line profile (`X-Mode`), with altitude-corrected air density ($\rho \approx 1.07\text{ kg/m}^3$) and ride-height-sensitive wings and floor. X-Mode top speeds: `≈338 / 331 / 324 km/h` for the low / balanced / high downforce packages.
 - **Tyres, Suspension & Brakes**:
   - Assetto Corsa-style tyre model with load sensitivity, combined slip, carcass relaxation, thermal window and wear across **Soft**, **Medium** and **Hard** compounds.
-  - Double-wishbone geometry (roll centres from the mod's hardpoints), springs, dampers, bump stops, anti-roll bars and heave elements; brake-by-wire with MGU-K harvest and optional TC/ABS. `320 → 100 km/h` takes `~100 m` with ABS.
+  - Double-wishbone geometry (roll centres from the mod's hardpoints), springs, dampers, bump stops, anti-roll bars and heave elements, and the mod's default-setup limited-slip differential; brake-by-wire with MGU-K harvest and optional TC/ABS. `320 → 100 km/h` takes `~100 m` with ABS.
+  - Traction control works on the friction circle: the wheelspin it allows shrinks as the rear tyres use more grip for cornering, so a throttle stab mid-corner is caught instead of spinning the car.
+- **Gamepad Steering Assist**: Controller steering modelled on Assetto Corsa's *Advanced Gamepad Assist* (Custom Shaders Patch). Full stick steers up to the front tyres' peak slip angle at any speed, the wheel self-aligns toward the rear axle's direction of travel to catch slides, and a yaw-rate guard stops held countersteer from turning into a tank-slapper. Can be switched off in the settings panel.
 - **Racing-Line AI**: Follows the circuit's racing line with a target-speed profile computed from the car's grip, downforce, brakes and power, and laps the circuit in `~1:38–1:39`.
 
-### 3. Serverless WebRTC Peer-to-Peer Multiplayer
+### 3. VF26 3D Model, Driver & Sounds (local only)
+- With the mod's assets converted into `public/vf26/` (see [`scripts/vf26/README.md`](scripts/vf26/README.md)), the procedural car is replaced by the VF26 model in its Haas livery. The wheels and uprights steer and spin, the brake discs glow, the shift lights follow rpm, X-Mode opens the wings using the mod's own DRS poses, and the tyre sidewall changes with the compound.
+- The AC EVO driver (suit, gloves, shoes and helmet in the mod's livery) sits in the cockpit, and their hands follow the steering wheel through the mod's `driver_steer` animation. The helmet is hidden in the cockpit camera, as in AC EVO. The cockpit, T-cam and nose cameras use the AC EVO camera positions.
+- Engine, turbo and transmission sounds are rendered offline from the mod's FMOD bank with the game's own FMOD runtime, then crossfaded by rpm, throttle, boost and speed (`src/lib/sim/vf26-audio.ts`). Interior and exterior banks switch with the camera.
+- `public/vf26/` is gitignored and never deployed: the model, textures and sounds belong to the mod author and Kunos. Without it, the procedural car and the built-in engine samples are used.
+
+### 4. Serverless WebRTC Peer-to-Peer Multiplayer
 - **6-Character Room Code Mode**: Host or join a room across the internet using `RTCPeerConnection` + unordered/unreliable `RTCDataChannel` (`ordered: false, maxRetransmits: 0`) over Google Public STUN (`stun:stun.l.google.com:19302`) and the public PeerJS signaling broker.
 - **Zero-Broker Manual SDP Copy-Paste Fallback**: Establish direct browser-to-browser WebRTC P2P connections without any signaling server by exchanging compact SDP Offer/Answer tokens.
 - **Same-Machine Multi-Tab Sync**: Automatic zero-configuration multiplayer across local browser tabs via `BroadcastChannel`, alongside autonomous AI grid cars interpolated at display frame rate via **Cubic Hermite splines** and **Quaternion Slerp**.
 
-### 4. Multi-Sample F1 V6 Hybrid Audio & F1TV Telemetry HUD
+### 5. Multi-Sample F1 V6 Hybrid Audio & F1TV Telemetry HUD
 - **Web Audio Synthesis**: Crossfades recorded F1 engine loops across RPM bands with turbocharger lag, MGU-K inverter whine, straight-cut gearbox harmonics, ignition-cut upshift crackles, and per-wheel tire squeal/kerb rumble.
 - **Broadcast HUD**: Live timing tower, 3-sector splits, scrolling pedal & Force-Feedback (FFB) trace, G-force friction circle, 4-wheel thermal/load/wear diagram, and interactive corner teleport menu.
 
@@ -40,6 +48,7 @@ A high-frequency, browser-based **2026 Formula 1 Grand Prix Simulator** set at t
 | **`W` / `Up Arrow`** | Throttle (ramped like a pedal) |
 | **`S` / `Down Arrow`** | Brake (ramped like a pedal) |
 | **`A` / `D`** or **`Left` / `Right`** | Steering (speed-sensitive on keyboard) |
+| **Gamepad** (Xbox / PlayStation) | Left stick steer (Gamepad Steering Assist), `RT` / `R2` throttle, `LT` / `L2` brake, `A` / `✕` boost |
 | **`V`** | Toggle 1:1 Analog Mouse Steering |
 | **`Space` / `Shift` / `B` / `/boost`** | Activate `350 kW` MGU-K Manual Override Boost |
 | **`X`** | Toggle 2026 Active Aero (`Z-Mode` / `X-Mode`) |
@@ -71,6 +80,11 @@ npm install
 # Rebuild binary track meshes, textures & spline data from Assetto Corsa source (optional)
 node "scripts/build-rwanda-track.mjs"
 
+# Convert the VF26 model, driver and sounds from your own AC EVO install (optional, local only;
+# see scripts/vf26/README.md)
+python -P scripts/vf26/port_model.py <extract> public/vf26/model/vf26.glb --driver-root <base-driver>
+python -P scripts/vf26/port_sounds.py <extract>/content/cars/gp_2026_vf26 public/vf26/audio
+
 # Run the automated 9-suite physics, braking, track & multiplayer verification suite
 npx tsx "scripts/verify-sim.ts"
 
@@ -91,7 +105,9 @@ This repository includes an automated GitHub Actions workflow (`.github/workflow
 
 ## Credits & Licenses
 
-- **Car Physics Data**: **Sim Dream — "Grand Prix 2026 VF26" (v2.2)**, Assetto Corsa EVO mod. The vehicle parameters in `src/lib/sim/vf26-data.ts` are taken from the mod package; values marked `[assumed]` there are not from the mod.
+- **Car Physics Data, 3D Model & Sounds**: **Sim Dream — "Grand Prix 2026 VF26" (v2.2)**, Assetto Corsa EVO mod. The vehicle parameters in `src/lib/sim/vf26-data.ts` are taken from the mod package; values marked `[assumed]` there are not from the mod. The model, liveries, driver skins and sounds are converted locally by `scripts/vf26/` and are not part of this repository or its deployments.
+- **Driver Model & Sound Runtime**: **Kunos Simulazioni — Assetto Corsa EVO** (base-game driver meshes and materials; the FMOD runtime is used only for local offline rendering).
+- **Gamepad Steering Assist Approach**: **Advanced Gamepad Assist** by **adam10603** (Custom Shaders Patch gamepad script for Assetto Corsa) — re-implemented in `src/lib/sim/gamepad-assist.ts`.
 - **Audio Synthesis & Visual FX Reference**: [**Speed Dreams / TORCS**](https://sourceforge.net/projects/speed-dreams/) — GPL-2.0+ License.
 - **Track Occupancy, Reference Lap & MPC Observation Architecture**: [**`assetto_corsa_gym`**](https://github.com/autonomous-racing-lab/assetto_corsa_gym) — MIT License.
 - **Track Layout & 3D Circuit Assets**: **Rwanda International Circuit (F1 2026 Variant)** by **Romeo Gagliotti (AlphaRomeo127)** (`ui_track.json`).

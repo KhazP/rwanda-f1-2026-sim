@@ -323,7 +323,7 @@ async function runVerification() {
   );
 
   // 9. Regression suite: aero load & ride heights, load transfer sign, ground contact, banking, cameras, recovery, braking
-  console.log('\n9. Testing Regression Suite (Aero Load, Load Transfer Sign, Ground Contact, Banking, Cameras, Recovery, Braking)...');
+  console.log('\n9. Testing Regression Suite (Aero Load, Load Transfer Sign, Ground Contact, Banking, Cameras, Recovery, Braking, Traction Control, Gamepad Assist)...');
 
   // 9.1 Downforce level and ride heights at 270 km/h
   assert(
@@ -491,9 +491,10 @@ async function runVerification() {
   const fullLockTelemetry = { ...simCorner.telemetry, steering: 1.0 };
   carRig.updateFromTelemetry(fullLockTelemetry, 0, 0, 0, 0);
   carRig.root.updateMatrixWorld(true);
+  // steering +1 = right turn -> +rotation.z about the forward axis = clockwise as seen from the seat
   assert(
-    Math.abs(carRig.steeringWheelGroup.rotation.z - -1.45) < 0.01,
-    `Steering wheel rotates smoothly to full lock (rotZ=${carRig.steeringWheelGroup.rotation.z.toFixed(2)} rad)`
+    Math.abs(carRig.steeringWheelGroup.rotation.z - 1.45) < 0.01,
+    `Steering wheel turns clockwise (to the right) at full right lock (rotZ=${carRig.steeringWheelGroup.rotation.z.toFixed(2)} rad)`
   );
 
   // Verify all 5 pre-rendered WAV loops in public/audio/f1_real_*.wav have seamless wrap-around and zero pitch wobble
@@ -662,12 +663,70 @@ async function runVerification() {
     `Braking-line urgency ahead of Turn 1 runs Green (${urgStart.toFixed(2)} @ 170m) -> Yellow (from ${firstYellow}m) -> Red (from ${firstRed}m) -> Green (${urgExit.toFixed(2)} @ ${apexS + 40}m; apex ${apexS}m at ${vMin.toFixed(0)} km/h)`
   );
 
+  // 9.10 Traction control (semi_pro) catches a throttle stab at the cornering limit: the car
+  //      accelerates out instead of spinning. Flat pad wide enough for the circles.
+  const wideFlat = createFlatTestTrack(30_000, 3000);
+  const slipDeg = (sim: F1Physics2026) => (Math.atan2(sim.vyMs, Math.max(1, Math.abs(sim.vxMs))) * 180) / Math.PI;
+  const speedHold = (sim: F1Physics2026, vMs: number) => THREE.MathUtils.clamp(0.25 + 0.6 * (vMs - sim.vxMs), 0, 1);
+  const tcStab = (vKmh: number, steer: number) => {
+    const sim = new F1Physics2026(wideFlat);
+    sim.setAssistPreset('semi_pro');
+    sim.teleportToDistance(1500, vKmh / 3.6);
+    let st = 0;
+    for (let t = 0; t < 4; t += 1 / 120) {
+      st = Math.min(steer, st + 0.15 / 120);
+      sim.step(1 / 120, { throttle: speedHold(sim, vKmh / 3.6), analogSteer: st });
+    }
+    let maxSlip = 0;
+    for (let t = 0; t < 3; t += 1 / 120) {
+      sim.step(1 / 120, { throttle: Math.min(1, t / 0.05), analogSteer: steer });
+      maxSlip = Math.max(maxSlip, Math.abs(slipDeg(sim)));
+    }
+    return { maxSlip, gainKmh: sim.telemetry.speedKmh - vKmh };
+  };
+  const stab90 = tcStab(90, 0.36);
+  const stab160 = tcStab(160, 0.18);
+  assert(
+    stab90.maxSlip < 10 && stab90.gainKmh > 15 && stab160.maxSlip < 12 && stab160.gainKmh > 5,
+    `TC+ABS: full throttle stab at ~80% of the cornering limit drives out without spinning (90 km/h: max body slip ${stab90.maxSlip.toFixed(1)}°, +${stab90.gainKmh.toFixed(0)} km/h; 160 km/h: ${stab160.maxSlip.toFixed(1)}°, +${stab160.gainKmh.toFixed(0)} km/h)`
+  );
+
+  // 9.11 Gamepad steering assist: full stick holds the car at its grip limit, full-stick flicks at
+  //      280 km/h stay stable, and a released stick self-aligns the car straight
+  const padRun = (vKmh: number, stick: (t: number) => number, seconds: number) => {
+    const sim = new F1Physics2026(wideFlat);
+    sim.setAssistPreset('semi_pro');
+    sim.teleportToDistance(1500, vKmh / 3.6);
+    let maxSlip = 0;
+    let lateralG = 0;
+    for (let t = 0; t < seconds; t += 1 / 120) {
+      sim.step(1 / 120, { throttle: speedHold(sim, vKmh / 3.6), padSteer: stick(t) });
+      maxSlip = Math.max(maxSlip, Math.abs(slipDeg(sim)));
+      lateralG = Math.abs(sim.telemetry.lateralG);
+    }
+    return { sim, maxSlip, lateralG };
+  };
+  const hold160 = padRun(160, () => 1, 4);
+  const hold240 = padRun(240, () => 1, 4);
+  const flick280 = padRun(280, (t) => (t < 0.3 ? 1 : t < 0.6 ? -1 : 0), 3);
+  const release200 = padRun(200, (t) => (t < 1 ? 1 : 0), 4);
+  assert(
+    hold160.maxSlip < 10 && hold160.lateralG > 2.4 && hold240.maxSlip < 10 && hold240.lateralG > 3.2,
+    `Gamepad full stick holds the car at its grip limit without spinning (160 km/h: ${hold160.lateralG.toFixed(2)} g, max body slip ${hold160.maxSlip.toFixed(1)}°; 240 km/h: ${hold240.lateralG.toFixed(2)} g, ${hold240.maxSlip.toFixed(1)}°)`
+  );
+  assert(
+    flick280.maxSlip < 10 &&
+      Math.abs(release200.sim.yawRateRadS) < 0.05 &&
+      Math.abs(slipDeg(release200.sim)) < 2,
+    `Gamepad full-stick right-left flick at 280 km/h stays stable (max body slip ${flick280.maxSlip.toFixed(1)}°) and a released stick straightens the car (yaw ${((release200.sim.yawRateRadS * 180) / Math.PI).toFixed(1)}°/s, slip ${slipDeg(release200.sim).toFixed(1)}°)`
+  );
+
   if (failures.length > 0) {
     console.log(`\n${failures.length} CHECK(S) FAILED:`);
     for (const f of failures) console.log(`  - ${f}`);
     process.exit(1);
   }
-  console.log('\nALL 9 VERIFICATION SUITES PASSED SUCCESSFULLY!');
+  console.log('\nALL VERIFICATION CHECKS PASSED SUCCESSFULLY!');
 }
 
 runVerification().catch((err) => {

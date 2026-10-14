@@ -32,6 +32,9 @@ const KB_THROTTLE_FALL_S = 0.1;
 const KB_BRAKE_RISE_S = 0.17;
 const KB_BRAKE_FALL_S = 0.08;
 /** Time for keyboard steering to reach its speed-dependent limit, and to recentre */
+// Rotates a camera (which looks down -Z) to look along the car's +Z forward axis
+const CAM_FORWARD_FLIP = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);
+const CAM_X_AXIS = new THREE.Vector3(1, 0, 0);
 const KB_STEER_RISE_S = 0.3;
 const KB_STEER_RETURN_S = 0.18;
 /** Keyboard steering limit: road-wheel angle for this lateral acceleration (m/s²) plus a peak slip allowance (rad) */
@@ -71,6 +74,7 @@ export const RwandaF1Simulator: React.FC = () => {
   const [audioUnlocked, setAudioUnlocked] = useState(false);
   const [boostLatch, setBoostLatch] = useState(false);
   const [mouseSteerEnabled, setMouseSteerEnabled] = useState(false);
+  const [gamepadAssist, setGamepadAssist] = useState(true);
   const [p2pStatus, setP2pStatus] = useState<P2PConnectionStatus>({
     mode: "local",
     roomCode: "",
@@ -137,6 +141,16 @@ export const RwandaF1Simulator: React.FC = () => {
     if (physicsRef.current) {
       physicsRef.current.assistPreset = preset;
     }
+  }, []);
+
+  const handleToggleGamepadAssist = useCallback(() => {
+    setGamepadAssist((prev) => {
+      const next = !prev;
+      if (physicsRef.current) {
+        physicsRef.current.gamepadAssistEnabled = next;
+      }
+      return next;
+    });
   }, []);
 
   const handleTireCompoundChange = useCallback((compound: TireCompound) => {
@@ -575,17 +589,23 @@ export const RwandaF1Simulator: React.FC = () => {
       const dtSeconds = Math.min((nowMs - lastTimeMs) / 1000, 0.05);
       lastTimeMs = nowMs;
 
-      // Optional Gamepad / Sim Racing Wheel Polling
+      // Optional Gamepad / Sim Racing Wheel Polling. Controllers with the standard mapping (Xbox,
+      // DualShock, DualSense …) send the raw thumbstick through the physics' gamepad steering
+      // assist every frame (also when centred: it self-aligns); other devices (wheels) drive the
+      // rack directly.
       let gamepadThrottle = 0;
       let gamepadBrake = 0;
       let gamepadSteer: number | undefined = undefined;
+      let gamepadStick: number | undefined = undefined;
       let gamepadBoost = false;
       if (typeof navigator !== "undefined" && navigator.getGamepads) {
         const pads = navigator.getGamepads();
         const pad = pads && pads[0];
         if (pad) {
           const rawStickX = pad.axes[0] || 0;
-          if (Math.abs(rawStickX) > 0.04) {
+          if (pad.mapping === "standard") {
+            gamepadStick = rawStickX;
+          } else if (Math.abs(rawStickX) > 0.04) {
             gamepadSteer = rawStickX;
           }
           if (pad.buttons[7]?.value) gamepadThrottle = pad.buttons[7].value;
@@ -596,7 +616,7 @@ export const RwandaF1Simulator: React.FC = () => {
 
       // Keyboard-only input shaping: keys become ramped pedals and a rate- and speed-limited
       // steering angle (about what keeps the front tyres near peak slip at this speed).
-      // Gamepad, wheel and mouse inputs are passed through untouched.
+      // Wheel and mouse inputs are passed through untouched.
       const keys = keysRef.current;
       const kb = kbInputRef.current;
       kb.throttle = approach(
@@ -637,6 +657,8 @@ export const RwandaF1Simulator: React.FC = () => {
         steerLeft: 0,
         steerRight: 0,
         analogSteer: kbSteerActive ? kb.steer : activeAnalogSteer,
+        padSteer:
+          kbSteerActive || mouseSteerEnabledRef.current ? undefined : gamepadStick,
         manualOverride:
           keysRef.current.boostHold || boostLatchRef.current || gamepadBoost,
         toggleXMode: keysRef.current.toggleX,
@@ -721,8 +743,11 @@ export const RwandaF1Simulator: React.FC = () => {
       }
 
       const mode = cameraModeRef.current;
+      const vf26Cams = carRig.getVf26CameraAnchors();
       // Hide driver helmet mesh only when inside first-person cockpit view so it never clips the camera
-      carRig.helmetGroup.visible = mode !== "cockpit";
+      // (the procedural driver is hidden entirely once the VF26 model has replaced the procedural car)
+      carRig.helmetGroup.visible = mode !== "cockpit" && !vf26Cams;
+      carRig.setCockpitView(mode === "cockpit");
 
       carRig.root.position.copy(physics.worldPosition);
       carRig.root.quaternion.copy(physics.worldQuaternion);
@@ -835,7 +860,32 @@ export const RwandaF1Simulator: React.FC = () => {
           ? Math.atan2(-physics.vyMs, Math.max(3, physics.vxMs))
           : 0;
 
-      if (mode === "chase") {
+      const vf26Cam =
+        vf26Cams &&
+        (mode === "cockpit"
+          ? vf26Cams.cockpit
+          : mode === "cockpit_shoulder"
+            ? vf26Cams.shoulder
+            : mode === "tv_pod"
+              ? vf26Cams.tcam
+              : mode === "nose"
+                ? vf26Cams.bumper
+                : null);
+      if (vf26Cam) {
+        // AC EVO onboard cameras from the mod (gp_2026_vf26.actor): bolted to the sprung chassis at the
+        // mod's position, pitch and field of view
+        carRig.chassisGroup.updateWorldMatrix(true, false);
+        camera.position.copy(vf26Cam.pos).applyMatrix4(carRig.chassisGroup.matrixWorld);
+        carRig.chassisGroup.getWorldQuaternion(camera.quaternion);
+        camera.quaternion
+          .multiply(CAM_FORWARD_FLIP)
+          .multiply(new THREE.Quaternion().setFromAxisAngle(CAM_X_AXIS, vf26Cam.pitchRad));
+        camera.up.copy(carUp);
+        if (camera.fov !== vf26Cam.fovDeg) {
+          camera.fov = vf26Cam.fovDeg;
+          camera.updateProjectionMatrix();
+        }
+      } else if (mode === "chase") {
         // iRacing / Assetto Corsa Horizon-Stabilized Sim Chase Rig:
         // Camera boom trails the car's true velocity & yaw trajectory
         const targetSlipYaw = THREE.MathUtils.clamp(
@@ -1069,6 +1119,7 @@ export const RwandaF1Simulator: React.FC = () => {
       }
 
       builtCircuit.updateEnvironment(nowMs * 0.001);
+      audioRef.current?.setCameraMode(cameraModeRef.current);
       audioRef.current?.update(physics.telemetry, dtSeconds);
 
       renderer.render(scene, camera);
@@ -1154,6 +1205,8 @@ export const RwandaF1Simulator: React.FC = () => {
         isMuted={isMuted}
         boostLatch={boostLatch}
         mouseSteerEnabled={mouseSteerEnabled}
+        gamepadAssist={gamepadAssist}
+        onToggleGamepadAssist={handleToggleGamepadAssist}
         p2pStatus={p2pStatus}
         onChangeAeroPreset={handleAeroPresetChange}
         onChangeAssistPreset={handleAssistPresetChange}
